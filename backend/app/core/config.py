@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import PostgresDsn, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,6 +25,18 @@ class Settings(BaseSettings):
     db_pool_size: int = 10
     db_max_overflow: int = 20
     db_echo_sql: bool = False   # set True in local dev to log queries
+
+    # ------------------------------------------------------------------
+    # AWS — S3 + KMS
+    # ------------------------------------------------------------------
+    aws_region:     str = "us-east-1"
+    aws_account_id: str = ""           # 12-digit account ID
+
+    s3_bucket: str = "rag-platform-documents"
+
+    # Local dev: set these; prod: use ECS task role / IRSA (no static keys)
+    aws_access_key_id:     str = ""
+    aws_secret_access_key: str = ""
 
     # ------------------------------------------------------------------
     # Application

@@ -7,3 +7,6 @@ pydantic-settings>=2.2.0
 # Database
 sqlalchemy>=2.0.30
 asyncpg>=0.29.0          # async PostgreSQL driver
+
+# AWS
+aioboto3>=13.0.0         # async boto3 wrapper for S3, KMS, IAM
