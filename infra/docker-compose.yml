@@ -11,13 +11,12 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_DB:       rag_platform
-      POSTGRES_USER:     app_admin          # migration role
+      POSTGRES_USER:     app_admin
       POSTGRES_PASSWORD: changeme_in_production
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      # Run the migration on first boot
       - ../backend/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U app_admin -d rag_platform"]
@@ -25,5 +24,57 @@ services:
       timeout: 5s
       retries: 5
 
+  # ---------------------------------------------------------------------------
+  # Weaviate — vector store with per-tenant collection isolation
+  # ---------------------------------------------------------------------------
+  weaviate:
+    image: semitechnologies/weaviate:1.25.0
+    container_name: rag_weaviate
+    restart: unless-stopped
+    ports:
+      - "8080:8080"   # REST / GraphQL
+      - "50051:50051" # gRPC
+    environment:
+      QUERY_DEFAULTS_LIMIT:             25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"   # dev only; use API key in prod
+      PERSISTENCE_DATA_PATH:            "/var/lib/weaviate"
+      DEFAULT_VECTORIZER_MODULE:        "none"           # we supply our own vectors
+      ENABLE_MODULES:                   ""
+      CLUSTER_HOSTNAME:                 "node1"
+      LOG_LEVEL:                        "info"
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/v1/.well-known/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # LocalStack — AWS S3 + KMS emulation for local development
+  # ---------------------------------------------------------------------------
+  localstack:
+    image: localstack/localstack:3.4
+    container_name: rag_localstack
+    restart: unless-stopped
+    ports:
+      - "4566:4566"   # unified endpoint for all AWS services
+    environment:
+      SERVICES:       s3,kms,iam
+      DEFAULT_REGION: us-east-1
+      DEBUG:          0
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
 volumes:
   postgres_data:
+  weaviate_data:
+  localstack_data:

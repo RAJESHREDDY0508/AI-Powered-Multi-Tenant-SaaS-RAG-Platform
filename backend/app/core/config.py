@@ -39,6 +39,49 @@ class Settings(BaseSettings):
     aws_secret_access_key: str = ""
 
     # ------------------------------------------------------------------
+    # Vector Store
+    # ------------------------------------------------------------------
+    vector_store_backend: str = "weaviate"   # "pinecone" | "weaviate"
+
+    # Pinecone
+    pinecone_api_key:    str = ""
+    pinecone_index_name: str = "rag-platform"
+
+    # Weaviate
+    weaviate_url:     str = "http://localhost:8080"
+    weaviate_host:    str = "localhost"
+    weaviate_port:    int = 8080
+    weaviate_api_key: str = ""   # empty = local/Docker (no auth)
+
+    # Embeddings
+    embedding_model:      str = "text-embedding-3-small"
+    embedding_dimensions: int = 1536
+
+    # ------------------------------------------------------------------
+    # LLM
+    # ------------------------------------------------------------------
+    openai_api_key:   str = ""
+    llm_model:        str = "gpt-4o-mini"
+    llm_temperature:  float = 0.0
+    llm_max_tokens:   int = 2048
+
+    # ------------------------------------------------------------------
+    # Auth — OIDC (AWS Cognito or Auth0)
+    # ------------------------------------------------------------------
+    auth_issuer:   str = ""   # e.g. https://cognito-idp.us-east-1.amazonaws.com/<pool_id>
+    auth_audience: str = ""   # Cognito App Client ID  /  Auth0 API Identifier
+
+    # Auth0-specific (leave empty when using Cognito)
+    auth0_namespace: str = "https://api.ragplatform.io"   # custom claim namespace
+
+    # AWS Cognito-specific
+    cognito_user_pool_id: str = ""
+    cognito_client_id:    str = ""
+
+    # S3 default KMS key (overridden per-tenant after provisioning)
+    s3_default_kms_key_arn: str = ""
+
+    # ------------------------------------------------------------------
     # Application
     # ------------------------------------------------------------------
     app_env: str = "development"   # development | staging | production

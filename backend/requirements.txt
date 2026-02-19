@@ -6,7 +6,20 @@ pydantic-settings>=2.2.0
 
 # Database
 sqlalchemy>=2.0.30
-asyncpg>=0.29.0          # async PostgreSQL driver
+asyncpg>=0.29.0              # async PostgreSQL driver
 
 # AWS
-aioboto3>=13.0.0         # async boto3 wrapper for S3, KMS, IAM
+aioboto3>=13.0.0             # async boto3 wrapper for S3, KMS, IAM
+
+# Vector Stores
+pinecone>=3.2.0              # Pinecone client v3+
+weaviate-client>=4.6.0       # Weaviate v4 client
+
+# LangChain — RAG orchestration
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-openai>=0.1.0      # OpenAI embeddings + chat
+
+# Auth — JWT / OIDC
+python-jose[cryptography]>=3.3.0   # JWT decode + JWKS verification
+httpx>=0.27.0                       # async HTTP (JWKS fetch)
