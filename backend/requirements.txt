@@ -7,6 +7,7 @@ pydantic-settings>=2.2.0
 # Database
 sqlalchemy>=2.0.30
 asyncpg>=0.29.0              # async PostgreSQL driver
+alembic>=1.13.0              # database migrations
 
 # AWS
 aioboto3>=13.0.0             # async boto3 wrapper for S3, KMS, IAM
@@ -19,7 +20,29 @@ weaviate-client>=4.6.0       # Weaviate v4 client
 langchain>=0.2.0
 langchain-core>=0.2.0
 langchain-openai>=0.1.0      # OpenAI embeddings + chat
+langchain-text-splitters>=0.2.0  # RecursiveCharacterTextSplitter
 
 # Auth — JWT / OIDC
 python-jose[cryptography]>=3.3.0   # JWT decode + JWKS verification
 httpx>=0.27.0                       # async HTTP (JWKS fetch)
+
+# Task Queue — Celery + Broker
+celery[redis]>=5.4.0         # async task queue with Redis result backend
+kombu>=5.3.0                 # AMQP message routing (RabbitMQ/Redis)
+redis>=5.0.0                 # Redis client (result backend + dev broker)
+
+# Document Parsing
+pypdf>=4.2.0                 # PDF text extraction (pure Python, no poppler dep)
+python-docx>=1.1.0           # DOCX text extraction
+
+# File type detection
+python-magic>=0.4.27         # libmagic bindings for MIME sniffing (Linux/Mac)
+# python-magic-bin>=0.4.14   # Windows: uncomment this, comment python-magic above
+
+# Observability
+structlog>=24.1.0            # structured logging
+prometheus-fastapi-instrumentator>=6.1.0  # /metrics endpoint
+
+# Testing
+pytest>=8.2.0
+pytest-asyncio>=0.23.0
