@@ -149,7 +149,8 @@ class Document(Base):
         nullable=False,
         comment="User-provided display name (distinct from raw filename)",
     )
-    metadata: Mapped[dict] = mapped_column(
+    doc_metadata: Mapped[dict] = mapped_column(
+        "metadata",                 # PostgreSQL column name stays 'metadata'
         JSONB,
         nullable=False,
         default=dict,
@@ -281,7 +282,8 @@ class AuditLog(Base):
     )
 
     # Structured payload — stores request metadata, checksums, S3 keys, etc.
-    metadata: Mapped[dict] = mapped_column(
+    doc_metadata: Mapped[dict] = mapped_column(
+        "metadata",                 # PostgreSQL column name stays 'metadata'
         JSONB,
         nullable=False,
         default=dict,

@@ -74,7 +74,178 @@ services:
       retries: 10
       start_period: 15s
 
+  # ---------------------------------------------------------------------------
+  # RabbitMQ — message broker for Celery task queue
+  #
+  # Ports:
+  #   5672  — AMQP protocol  (used by Celery workers and the FastAPI app)
+  #   15672 — Management UI  (http://localhost:15672  user: guest / guest)
+  #
+  # Queues auto-declared by Celery:
+  #   documents.ingest   — primary ingestion queue
+  #   documents.retry    — exponential-backoff retry queue
+  #   system.health      — periodic health checks
+  # ---------------------------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: rag_rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"     # AMQP (Celery broker)
+      - "15672:15672"   # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER:  guest
+      RABBITMQ_DEFAULT_PASS:  guest
+      RABBITMQ_DEFAULT_VHOST: /
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Redis — Celery result backend + future caching layer
+  #
+  # Port:
+  #   6379 — Redis protocol  (used as CELERY_RESULT_BACKEND)
+  #
+  # Databases:
+  #   0  — reserved (default)
+  #   1  — Celery task results    (CELERY_RESULT_BACKEND=redis://localhost:6379/1)
+  #   2  — Application cache      (future: JWKS TTL, rate-limiting counters)
+  #   3  — SSE progress queues    (future: multi-instance SSE via pub/sub)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7.2-alpine
+    container_name: rag_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+        --maxmemory 256mb
+        --maxmemory-policy allkeys-lru
+        --save 900 1
+        --save 300 10
+        --save 60 10000
+        --appendonly yes
+        --appendfsync everysec
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Celery Worker — processes documents.ingest queue
+  #
+  # Runs in the same container image as the FastAPI app (reuses requirements.txt).
+  # Build from the backend Dockerfile.
+  # Increase --concurrency for production (1 is safe for local dev with heavy ML).
+  # ---------------------------------------------------------------------------
+  celery_worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: rag_celery_worker
+    restart: unless-stopped
+    command: >
+      celery -A app.workers.celery_app:celery_app worker
+        --loglevel=info
+        --concurrency=2
+        --queues=documents.ingest,documents.retry
+        --hostname=worker@%h
+    environment:
+      DATABASE_URL:             postgresql+asyncpg://app_admin:changeme_in_production@postgres:5432/rag_platform
+      CELERY_BROKER_URL:        amqp://guest:guest@rabbitmq:5672//
+      CELERY_RESULT_BACKEND:    redis://redis:6379/1
+      AWS_REGION:               us-east-1
+      AWS_ACCESS_KEY_ID:        test
+      AWS_SECRET_ACCESS_KEY:    test
+      S3_ENDPOINT_URL:          http://localstack:4566
+      S3_BUCKET:                rag-documents
+      S3_DEFAULT_KMS_KEY_ARN:   arn:aws:kms:us-east-1:000000000000:key/test-key
+      WEAVIATE_HOST:            weaviate
+      WEAVIATE_PORT:            "8080"
+      OPENAI_API_KEY:           ${OPENAI_API_KEY:-sk-placeholder}
+      VECTOR_STORE_BACKEND:     weaviate
+      APP_ENV:                  development
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    volumes:
+      - ../backend:/app   # live reload for local development
+
+  # ---------------------------------------------------------------------------
+  # Celery Beat — periodic task scheduler (retry scanner, health checks)
+  #
+  # Runs the Beat scheduler process separately from the worker.
+  # Uses a single Beat scheduler per deployment (not replicated).
+  # ---------------------------------------------------------------------------
+  celery_beat:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: rag_celery_beat
+    restart: unless-stopped
+    command: >
+      celery -A app.workers.celery_app:celery_app beat
+        --loglevel=info
+        --scheduler=celery.beat:PersistentScheduler
+        --schedule=/tmp/celerybeat-schedule
+    environment:
+      DATABASE_URL:          postgresql+asyncpg://app_admin:changeme_in_production@postgres:5432/rag_platform
+      CELERY_BROKER_URL:     amqp://guest:guest@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      APP_ENV:               development
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Flower — real-time Celery task monitor (web UI)
+  #
+  # Access at http://localhost:5555
+  # Shows task counts, worker state, retry history.
+  # ---------------------------------------------------------------------------
+  flower:
+    image: mher/flower:2.0
+    container_name: rag_flower
+    restart: unless-stopped
+    ports:
+      - "5555:5555"
+    command: >
+      celery
+        --broker=amqp://guest:guest@rabbitmq:5672//
+        flower
+        --port=5555
+        --url_prefix=
+    environment:
+      CELERY_BROKER_URL:     amqp://guest:guest@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+
 volumes:
   postgres_data:
   weaviate_data:
   localstack_data:
+  rabbitmq_data:
+  redis_data:

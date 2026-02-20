@@ -267,7 +267,7 @@ async def _process_document_async(
             user_id=None,     # system action
             action="document.processing_completed",
             resource=f"document:{document_id}",
-            metadata={
+            doc_metadata={
                 "chunk_count":  len(chunks),
                 "vector_count": len(vector_records),
                 "vector_store": settings.vector_store_backend,
@@ -377,7 +377,7 @@ async def _mark_failed(
             user_id=None,
             action="document.processing_failed",
             resource=f"document:{document_id}",
-            metadata={"error": error_message},
+            doc_metadata={"error": error_message},
             success=False,
         ))
 

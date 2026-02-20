@@ -1,32 +1,47 @@
 """
-Document Ingestion API Router
-POST /api/v1/documents/upload
+Document Ingestion Router  —  Production Rewrite
+═════════════════════════════════════════════════
 
-Implements:
-  - Multipart file upload with strict validation
-  - Multi-tenant isolation via JWT-extracted tenant_id
-  - RBAC enforcement (minimum role: member)
-  - Server-Sent Events (SSE) progress stream for upload phase
-  - Async processing dispatch to Celery
-  - Structured error responses for all 4xx/5xx cases
-  - SOC2 audit logging (delegated to IngestionService)
+Endpoints
+─────────
+  POST   /api/v1/documents/upload                     Upload + ingest a document
+  GET    /api/v1/documents/{id}/status                Poll async processing status
+  GET    /api/v1/documents/upload-progress/{token}    SSE real-time upload progress
+  GET    /api/v1/documents/                           Paginated tenant document list
+  DELETE /api/v1/documents/{id}                       Soft-delete a document
 
-Request lifecycle:
-  ┌─────────────────────────────────────────────────────────┐
-  │ 1. JWT verification → extract tenant_id + role (no      │
-  │    client-supplied tenant)                               │
-  │ 2. RBAC gate (member or above)                          │
-  │ 3. File type validation (magic bytes + extension)        │
-  │ 4. MD5 checksum + duplicate check (409 on collision)    │
-  │ 5. S3 upload under tenants/<tenant_id>/documents/       │
-  │ 6. DB insert (status=pending, RLS-enforced)              │
-  │ 7. Celery task published → returns 202                  │
-  └─────────────────────────────────────────────────────────┘
+Dependency injection chain (no lambda hacks)
+────────────────────────────────────────────
+  Every route receives its dependencies through proper FastAPI Depends()
+  classes/functions. The chain is:
 
-SSE stream (GET /upload-progress/{upload_token}):
-  Emits JSON events: { stage, bytes_received, bytes_total, percent }
-  Client EventSource connects before calling POST, receives real-time
-  progress updates during the upload phase.
+    ┌─ require_member ──▶ get_current_user ──▶ HTTPBearer ──▶ verify_token
+    │                                           (RS256, JWKS, Cognito/Auth0)
+    │
+    ├─ get_tenant_db  ──▶ get_current_user ──▶ get_db(tenant_id)
+    │                     (extracts tenant_id from JWT, sets RLS GUC)
+    │
+    └─ get_tenant_storage ──▶ get_current_user ──▶ S3StorageService(kms_key_arn)
+
+  This is strictly single-evaluation per request — FastAPI caches Depends()
+  results within a single request scope, so get_current_user is called once
+  even when it appears in multiple dependency trees.
+
+SSE upload progress
+───────────────────
+  1. Client calls GET /upload-progress/{token}  →  EventSource connected
+  2. Client calls POST /upload?upload_token={token}
+  3. IngestionService receives a progress_cb that pushes to the SSE queue
+  4. Each 5 MB part upload fires a progress event
+  5. On completion, a "stage": "queuing" event closes the stream
+
+Security properties (verified per-request)
+──────────────────────────────────────────
+  • tenant_id    extracted from JWT exclusively — never from body/query/header
+  • MIME type    detected from magic bytes  — never from Content-Type
+  • File size    rejected by Content-Length before reading the first byte
+  • Checksum     computed server-side during streaming
+  • S3 key       server-constructed; client never controls the path
 """
 
 from __future__ import annotations
@@ -36,7 +51,7 @@ import json
 import logging
 import time
 import uuid
-from typing import AsyncGenerator, Optional
+from typing import Annotated, AsyncGenerator, Optional
 from uuid import UUID
 
 from fastapi import (
@@ -45,18 +60,19 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Query,
     Request,
     UploadFile,
     status,
 )
 from fastapi.responses import JSONResponse, StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.dependencies import CurrentUser, TenantDB, TenantStorage
+from app.auth.dependencies import get_tenant_db, get_tenant_storage
 from app.auth.rbac import require_role
-from app.auth.token import TokenPayload
-from app.models.documents import Document
+from app.auth.token import TokenPayload, get_current_user
+from app.models.documents import AuditLog, Document
 from app.schemas.documents import (
     MAX_FILE_SIZE_BYTES,
     DocumentStatusResponse,
@@ -64,10 +80,9 @@ from app.schemas.documents import (
     ErrorResponse,
     ProcessingStatus,
     UploadErrors,
-    UploadProgressEvent,
 )
 from app.services.ingestion import IngestionService, TaskPublisher
-from app.storage.s3 import S3StorageService
+from app.storage.s3 import ResourceType, S3StorageService
 
 logger = logging.getLogger(__name__)
 
@@ -77,100 +92,168 @@ router = APIRouter(
 )
 
 
-# ---------------------------------------------------------------------------
-# In-memory SSE progress store
-# Key: upload_token (str UUID), Value: asyncio.Queue of progress dicts
-# In production, replace with Redis pub/sub for multi-instance deployments.
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# SSE progress store
+# Key:   upload_token (str)
+# Value: asyncio.Queue[dict]
+#
+# In production with multiple API instances, replace with Redis pub/sub:
+#   await redis.publish(f"upload:progress:{token}", json.dumps(event))
+# ─────────────────────────────────────────────────────────────────────────────
 
-_PROGRESS_QUEUES: dict[str, asyncio.Queue] = {}
-_UPLOAD_TOKEN_TTL = 300  # 5 minutes
+_SSE_QUEUES: dict[str, asyncio.Queue] = {}
+_SSE_TTL_SECS = 300   # 5 minutes
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Re-usable dependency shortcuts with proper RBAC
+# These are named callables (not lambdas) so FastAPI can cache them correctly
+# and they appear cleanly in OpenAPI docs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# member+ — for upload and write operations
+RequireMember = Depends(require_role("member"))
+# viewer+  — for read operations
+RequireViewer = Depends(require_role("viewer"))
+# admin+   — for destructive operations
+RequireAdmin  = Depends(require_role("admin"))
+
+
+async def _member_user(
+    user: Annotated[TokenPayload, Depends(require_role("member"))],
+) -> TokenPayload:
+    return user
+
+
+async def _viewer_user(
+    user: Annotated[TokenPayload, Depends(require_role("viewer"))],
+) -> TokenPayload:
+    return user
+
+
+async def _admin_user(
+    user: Annotated[TokenPayload, Depends(require_role("admin"))],
+) -> TokenPayload:
+    return user
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # POST /documents/upload
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 @router.post(
     "/upload",
     response_model=DocumentUploadResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Upload a document for ingestion",
+    summary="Upload a document for async ingestion",
     description=(
-        "Accepts PDF, DOCX, or TXT files up to 50 MB. "
-        "Returns 202 immediately; processing is asynchronous. "
-        "Poll GET /documents/{id}/status for pipeline progress."
+        "Streams file directly to S3 via multipart upload. "
+        "Returns 202 immediately; chunking + embedding runs asynchronously. "
+        "Supports PDF, DOCX, TXT, MD — max 50 MB. "
+        "Duplicate files (same MD5 within tenant) return 409."
     ),
     responses={
-        202: {"model": DocumentUploadResponse, "description": "File accepted for processing"},
-        400: {"model": ErrorResponse, "description": "Invalid file type, size, or request format"},
-        401: {"model": ErrorResponse, "description": "Missing or invalid JWT"},
-        403: {"model": ErrorResponse, "description": "Insufficient role (requires member+)"},
-        409: {"model": ErrorResponse, "description": "Duplicate document (same checksum exists in tenant)"},
-        413: {"model": ErrorResponse, "description": "File exceeds 50 MB limit"},
-        500: {"model": ErrorResponse, "description": "Internal server error"},
-        503: {"model": ErrorResponse, "description": "Message broker unavailable"},
+        202: {"model": DocumentUploadResponse,
+              "description": "File stored; processing queued"},
+        400: {"model": ErrorResponse,
+              "description": "Invalid file type, empty file, or bad document_name"},
+        401: {"model": ErrorResponse,
+              "description": "Missing, expired, or invalid Bearer JWT"},
+        403: {"model": ErrorResponse,
+              "description": "Insufficient role — requires 'member' or above"},
+        409: {"model": ErrorResponse,
+              "description": "Duplicate document — same MD5 already exists in tenant"},
+        413: {"model": ErrorResponse,
+              "description": "File exceeds the 50 MB limit"},
+        500: {"model": ErrorResponse,
+              "description": "S3 failure or unhandled server error"},
+        503: {"model": ErrorResponse,
+              "description": "Message broker unavailable (file still stored; will retry)"},
     },
 )
 async def upload_document(
     request:    Request,
-    file:       UploadFile     = File(..., description="Document file (PDF, DOCX, TXT — max 50 MB)"),
-    document_name: str         = Form(..., min_length=1, max_length=255, description="Display name for the document"),
+
+    # ── Multipart form fields ──────────────────────────────────────────
+    file: UploadFile = File(
+        ...,
+        description="Document file (PDF, DOCX, TXT, MD). Max 50 MB.",
+    ),
+    document_name: str = Form(
+        ...,
+        min_length=1,
+        max_length=255,
+        description="Human-readable display name for this document.",
+    ),
     document_permissions: Optional[str] = Form(
         None,
-        description="Optional JSON string: access permissions metadata",
+        description='Optional JSON object: e.g. {"groups": ["finance"], "public": false}',
     ),
-    # --- Injected dependencies (never from request body) ---
-    user:    TokenPayload  = Depends(require_role("member")),
-    db:      AsyncSession  = Depends(lambda u=Depends(require_role("member")): _get_db_from_user(u)),
-    storage: S3StorageService = Depends(lambda u=Depends(require_role("member")): _get_storage_from_user(u)),
+    upload_token: Optional[str] = Form(
+        None,
+        description="SSE upload_token obtained from GET /upload-progress. "
+                    "Enables real-time progress streaming.",
+    ),
+
+    # ── Auth dependencies (correctly chained, no lambdas) ─────────────
+    user:    TokenPayload  = Depends(_member_user),
+    db:      AsyncSession  = Depends(get_tenant_db),
+    storage: S3StorageService = Depends(get_tenant_storage),
 ) -> JSONResponse:
     """
-    Upload endpoint with full ingestion pipeline.
+    Multipart upload handler.
 
-    Security properties enforced here:
-      - tenant_id is extracted from the verified JWT only (user.tenant_id)
-      - File type detected from magic bytes, NOT client Content-Type
-      - document_permissions are stored as opaque metadata; never evaluated server-side
-      - client_ip extracted from X-Forwarded-For for audit log (sanitized)
+    Security:
+      • user.tenant_id comes from the verified JWT — never from the request body.
+      • file type is detected from magic bytes before any DB/S3 operation.
+      • Content-Length header is checked first to reject oversized requests early.
+      • upload_token is optional; absence means no SSE progress stream.
     """
-    request_id = str(uuid.uuid4())
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
 
-    # Sanitize and parse optional permissions
+    # ── Early size rejection from Content-Length header ────────────────
+    # This fires before reading a single byte of the body.
+    try:
+        raw_cl = request.headers.get("content-length")
+        content_length: int | None = int(raw_cl) if raw_cl else None
+    except (ValueError, TypeError):
+        content_length = None
+
+    if content_length and content_length > MAX_FILE_SIZE_BYTES + 8192:
+        return JSONResponse(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            content=UploadErrors.file_too_large(content_length).model_dump(mode="json"),
+            headers={"X-Request-ID": request_id},
+        )
+
+    # ── Parse optional permissions JSON ───────────────────────────────
     permissions: dict | None = None
     if document_permissions:
         try:
             permissions = json.loads(document_permissions)
             if not isinstance(permissions, dict):
-                raise ValueError("document_permissions must be a JSON object")
-        except (json.JSONDecodeError, ValueError) as exc:
+                raise ValueError
+        except (json.JSONDecodeError, ValueError):
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content=ErrorResponse(
                     error_code="INVALID_PERMISSIONS_FORMAT",
-                    message="document_permissions must be a valid JSON object string.",
-                    details=[],
+                    message="document_permissions must be a valid JSON object.",
                     request_id=request_id,
                 ).model_dump(mode="json"),
+                headers={"X-Request-ID": request_id},
             )
 
-    # Extract client IP for audit log (handle reverse proxy headers)
-    client_ip: str | None = _extract_client_ip(request)
+    # ── Build SSE progress callback (if upload_token provided) ────────
+    progress_cb = _make_progress_cb(upload_token, content_length) if upload_token else None
 
-    # Guard: reject oversized requests before reading body
-    content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > MAX_FILE_SIZE_BYTES + 4096:  # +4KB for form overhead
-        return JSONResponse(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            content=UploadErrors.file_too_large(int(content_length)).model_dump(mode="json"),
-        )
-
-    # Run ingestion pipeline
+    # ── Build and run ingestion pipeline ──────────────────────────────
     service = IngestionService(
         db=db,
         storage=storage,
         user=user,
         task_publisher=TaskPublisher(),
+        progress_cb=progress_cb,
     )
 
     try:
@@ -178,11 +261,13 @@ async def upload_document(
             file=file,
             document_name=document_name,
             permissions=permissions,
-            client_ip=client_ip,
+            client_ip=_client_ip(request),
+            content_length=content_length,
         )
     except HTTPException:
+        # Re-raise FastAPI HTTPExceptions with their structured detail intact
         raise
-    except Exception as exc:
+    except Exception:
         logger.exception(
             "Unhandled ingestion error | tenant=%s request_id=%s",
             user.tenant_id, request_id,
@@ -193,58 +278,152 @@ async def upload_document(
             headers={"X-Request-ID": request_id},
         )
 
+    # ── Emit final SSE event ───────────────────────────────────────────
+    if upload_token:
+        await _sse_push(upload_token, {
+            "event": "upload_progress",
+            "stage": "queuing",
+            "bytes_received": result.size_bytes,
+            "bytes_total":    result.size_bytes,
+            "percent":        100.0,
+        })
+
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,
         content=result.model_dump(mode="json"),
         headers={
-            "X-Request-ID":   request_id,
-            "X-Document-ID":  str(result.document_id),
-            "X-Tenant-ID":    str(result.tenant_id),
-            "Location":       f"/api/v1/documents/{result.document_id}/status",
+            "X-Request-ID":  request_id,
+            "X-Document-ID": str(result.document_id),
+            "X-Tenant-ID":   str(result.tenant_id),
+            "Location":      f"/api/v1/documents/{result.document_id}/status",
         },
     )
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /documents/upload-progress/{upload_token}  — SSE stream
+# Must be registered BEFORE /{document_id}/... routes to avoid shadowing.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/upload-progress/{upload_token}",
+    summary="Stream upload progress via Server-Sent Events",
+    description=(
+        "Connect via EventSource BEFORE calling POST /upload. "
+        "Pass the same upload_token as a form field in the POST request. "
+        "Receives JSON progress events; stream closes when upload is queued or times out."
+    ),
+    response_class=StreamingResponse,
+    include_in_schema=True,
+)
+async def stream_upload_progress(
+    upload_token: str,
+    request:      Request,
+    user: TokenPayload = Depends(_viewer_user),   # auth required even for SSE
+) -> StreamingResponse:
+    """
+    SSE endpoint for real-time upload progress.
+
+    Event format:
+        event: upload_progress
+        data: {"stage": "uploading", "bytes_received": 10485760,
+                "bytes_total": 52428800, "percent": 20.0}
+
+    Stages: uploading → validating → storing → queuing → done
+    """
+    queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=200)
+    _SSE_QUEUES[upload_token] = queue
+
+    async def generate() -> AsyncGenerator[str, None]:
+        start = time.monotonic()
+        try:
+            # Initial handshake
+            yield _sse("connected", {
+                "message":      "Progress stream ready",
+                "upload_token": upload_token,
+            })
+
+            while True:
+                # Honour client disconnect
+                if await request.is_disconnected():
+                    break
+
+                # Enforce TTL
+                if time.monotonic() - start > _SSE_TTL_SECS:
+                    yield _sse("timeout", {"message": "Upload progress stream expired"})
+                    break
+
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"   # prevent proxy timeouts
+                    continue
+
+                yield _sse(event.get("event", "upload_progress"), event)
+
+                # Terminal stages close the stream
+                if event.get("stage") in ("queuing", "error"):
+                    yield _sse("done", {"message": "Upload pipeline complete"})
+                    break
+
+        finally:
+            _SSE_QUEUES.pop(upload_token, None)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache",
+            "Connection":        "keep-alive",
+            "X-Accel-Buffering": "no",    # nginx: disable proxy buffering for SSE
+        },
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # GET /documents/{document_id}/status
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 @router.get(
     "/{document_id}/status",
     response_model=DocumentStatusResponse,
-    summary="Poll async processing status",
+    summary="Poll async processing status of a document",
     responses={
         200: {"model": DocumentStatusResponse},
-        401: {"model": ErrorResponse},
-        403: {"model": ErrorResponse},
-        404: {"model": ErrorResponse},
+        401: {"model": ErrorResponse, "description": "Invalid JWT"},
+        403: {"model": ErrorResponse, "description": "Insufficient role"},
+        404: {"model": ErrorResponse, "description": "Document not found in this tenant"},
     },
 )
 async def get_document_status(
     document_id: UUID,
-    user:  TokenPayload   = Depends(require_role("viewer")),
-    db:    AsyncSession   = Depends(lambda u=Depends(require_role("viewer")): _get_db_from_user(u)),
+    user: TokenPayload = Depends(_viewer_user),
+    db:   AsyncSession = Depends(get_tenant_db),
 ) -> DocumentStatusResponse:
     """
-    Returns the current processing status of a document.
-    RLS ensures tenants can only query their own documents.
+    Returns current processing pipeline state for a document.
+    RLS on saas.documents automatically scopes the query to the tenant.
     """
-    result = await db.execute(
+    row = await db.execute(
         select(Document).where(Document.id == document_id)
     )
-    doc = result.scalars().first()
+    doc = row.scalars().first()
 
-    if not doc:
+    if doc is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=UploadErrors.document_not_found(document_id).model_dump(),
         )
 
+    # Map DB status to ProcessingStatus enum (graceful fallback)
+    try:
+        ps = ProcessingStatus(doc.status)
+    except ValueError:
+        ps = ProcessingStatus.FAILED
+
     return DocumentStatusResponse(
         document_id=doc.id,
-        processing_status=ProcessingStatus(doc.status)
-        if doc.status in ProcessingStatus._value2member_map_
-        else ProcessingStatus.FAILED,
+        processing_status=ps,
         chunk_count=doc.chunk_count,
         vector_count=doc.vector_count,
         error_message=doc.error_message,
@@ -252,146 +431,82 @@ async def get_document_status(
     )
 
 
-# ---------------------------------------------------------------------------
-# GET /documents/upload-progress/{upload_token}  — SSE stream
-# ---------------------------------------------------------------------------
-
-@router.get(
-    "/upload-progress/{upload_token}",
-    summary="Stream upload progress via Server-Sent Events",
-    description=(
-        "Connect via EventSource before calling POST /upload. "
-        "Receives progress events: { stage, bytes_received, bytes_total, percent }. "
-        "Stream auto-closes after upload completes or after 5 minutes."
-    ),
-    response_class=StreamingResponse,
-)
-async def stream_upload_progress(
-    upload_token: str,
-    request: Request,
-    user: TokenPayload = Depends(require_role("viewer")),
-) -> StreamingResponse:
-    """
-    SSE endpoint — emits upload progress events for the given upload_token.
-    Client creates an EventSource connection and receives JSON-encoded progress.
-    """
-    queue: asyncio.Queue = asyncio.Queue(maxsize=100)
-    _PROGRESS_QUEUES[upload_token] = queue
-
-    async def event_generator() -> AsyncGenerator[str, None]:
-        """Yield SSE-formatted events until done or disconnected."""
-        start = time.monotonic()
-        try:
-            # Send initial connection event
-            yield _sse_event(
-                "connected",
-                {"message": "Upload progress stream connected", "token": upload_token},
-            )
-
-            while True:
-                # Respect client disconnection
-                if await request.is_disconnected():
-                    logger.debug("SSE client disconnected | token=%s", upload_token)
-                    break
-
-                # Enforce TTL
-                if time.monotonic() - start > _UPLOAD_TOKEN_TTL:
-                    yield _sse_event("timeout", {"message": "Progress stream expired"})
-                    break
-
-                try:
-                    event: dict = await asyncio.wait_for(queue.get(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    # Send keepalive comment to prevent proxy from closing connection
-                    yield ": keepalive\n\n"
-                    continue
-
-                yield _sse_event(event.get("event", "upload_progress"), event)
-
-                if event.get("stage") in ("queuing", "complete", "error"):
-                    yield _sse_event("done", {"message": "Upload complete"})
-                    break
-
-        finally:
-            _PROGRESS_QUEUES.pop(upload_token, None)
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control":    "no-cache",
-            "Connection":       "keep-alive",
-            "X-Accel-Buffering": "no",  # disable nginx buffering for SSE
-        },
-    )
-
-
-# ---------------------------------------------------------------------------
-# GET /documents/  — list documents (tenant-scoped)
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /documents/
+# ─────────────────────────────────────────────────────────────────────────────
 
 @router.get(
     "/",
-    summary="List documents in tenant",
+    summary="List documents in the authenticated tenant",
+    response_description="Paginated document list",
     responses={
-        200: {"description": "Paginated list of documents"},
+        200: {"description": "Document list"},
         401: {"model": ErrorResponse},
         403: {"model": ErrorResponse},
     },
 )
 async def list_documents(
-    page:  int = 1,
-    limit: int = 20,
-    user:  TokenPayload = Depends(require_role("viewer")),
-    db:    AsyncSession = Depends(lambda u=Depends(require_role("viewer")): _get_db_from_user(u)),
+    page:   int = Query(default=1,  ge=1,   description="Page number (1-based)"),
+    limit:  int = Query(default=20, ge=1, le=100, description="Items per page"),
+    status_filter: Optional[str] = Query(
+        None,
+        alias="status",
+        description="Filter by status: pending | processing | ready | failed",
+    ),
+    user: TokenPayload = Depends(_viewer_user),
+    db:   AsyncSession = Depends(get_tenant_db),
 ) -> dict:
     """
-    Returns paginated list of documents for the authenticated tenant.
-    Excludes soft-deleted documents. RLS enforces tenant scope.
+    Returns paginated, tenant-scoped document list.
+    Soft-deleted documents are excluded by default.
+    RLS enforces tenant isolation — no manual WHERE tenant_id clause needed.
     """
-    if limit > 100:
-        limit = 100
     offset = (page - 1) * limit
 
-    result = await db.execute(
-        select(Document)
-        .where(Document.status != "deleted")
-        .order_by(Document.created_at.desc())
-        .offset(offset)
-        .limit(limit)
-    )
-    docs = result.scalars().all()
+    query = select(Document).where(Document.status != "deleted")
+
+    if status_filter and status_filter in ("pending", "processing", "ready", "failed"):
+        query = query.where(Document.status == status_filter)
+
+    query = query.order_by(Document.created_at.desc()).offset(offset).limit(limit)
+    rows = await db.execute(query)
+    docs = rows.scalars().all()
 
     return {
-        "page":      page,
-        "limit":     limit,
+        "page":   page,
+        "limit":  limit,
         "documents": [
             {
-                "document_id":       str(d.id),
-                "document_name":     d.document_name,
-                "filename":          d.filename,
-                "status":            d.status,
-                "size_bytes":        d.size_bytes,
-                "content_type":      d.content_type,
-                "chunk_count":       d.chunk_count,
-                "vector_count":      d.vector_count,
-                "created_at":        d.created_at.isoformat(),
+                "document_id":   str(d.id),
+                "document_name": d.document_name,
+                "filename":      d.filename,
+                "status":        d.status,
+                "size_bytes":    d.size_bytes,
+                "content_type":  d.content_type,
+                "chunk_count":   d.chunk_count,
+                "vector_count":  d.vector_count,
+                "created_at":    d.created_at.isoformat(),
+                "updated_at":    d.updated_at.isoformat(),
             }
             for d in docs
         ],
     }
 
 
-# ---------------------------------------------------------------------------
-# DELETE /documents/{document_id}  — soft delete
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# DELETE /documents/{document_id}
+# ─────────────────────────────────────────────────────────────────────────────
 
 @router.delete(
     "/{document_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Soft-delete a document",
+    description=(
+        "Sets status='deleted'; tags the S3 object (lifecycle rule purges after 30 days). "
+        "Requires 'admin' role or above."
+    ),
     responses={
-        204: {"description": "Document deleted"},
+        204: {"description": "Document soft-deleted"},
         401: {"model": ErrorResponse},
         403: {"model": ErrorResponse},
         404: {"model": ErrorResponse},
@@ -399,116 +514,112 @@ async def list_documents(
 )
 async def delete_document(
     document_id: UUID,
-    user:    TokenPayload     = Depends(require_role("admin")),
-    db:      AsyncSession     = Depends(lambda u=Depends(require_role("admin")): _get_db_from_user(u)),
-    storage: S3StorageService = Depends(lambda u=Depends(require_role("admin")): _get_storage_from_user(u)),
+    user:    TokenPayload     = Depends(_admin_user),
+    db:      AsyncSession     = Depends(get_tenant_db),
+    storage: S3StorageService = Depends(get_tenant_storage),
 ) -> None:
     """
-    Soft-deletes a document: sets status='deleted', tags S3 object.
-    Hard S3 deletion is handled by a scheduled lifecycle job.
-    Requires admin role or above.
+    Soft-delete: marks document as deleted in the DB and tags the S3 object.
+    Vectors in Pinecone/Weaviate are purged by a background job watching
+    for status='deleted' documents (outside the scope of this request).
+    Requires admin role — viewers and members cannot delete.
     """
-    from sqlalchemy import update as sa_update
-    from app.models.documents import AuditLog
-    from app.storage.s3 import ResourceType
-
-    result = await db.execute(
+    row = await db.execute(
         select(Document).where(Document.id == document_id)
     )
-    doc = result.scalars().first()
+    doc = row.scalars().first()
 
-    if not doc:
+    if doc is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=UploadErrors.document_not_found(document_id).model_dump(),
         )
 
-    # Soft-delete in DB
+    # Update status in DB
     await db.execute(
         sa_update(Document)
         .where(Document.id == document_id)
         .values(status="deleted")
     )
 
-    # Soft-delete in S3 (tag object — lifecycle rule handles purge)
-    filename = doc.s3_key.rsplit("/", 1)[-1]
+    # Tag the S3 object (soft delete — lifecycle rule expires it after 30 days)
+    s3_filename = doc.s3_key.rsplit("/", 1)[-1]
     try:
-        await storage.delete_object(ResourceType.DOCUMENT, filename, hard=False)
+        await storage.delete_object(ResourceType.DOCUMENT, s3_filename, hard=False)
     except Exception as exc:
-        logger.warning("S3 soft-delete failed | doc=%s error=%s", document_id, exc)
+        logger.warning(
+            "S3 soft-delete tagging failed (non-fatal) | doc=%s error=%s",
+            document_id, exc,
+        )
 
-    # Audit log
+    # Append audit log entry
     db.add(AuditLog(
         tenant_id=user.tenant_id,
-        user_id=uuid.UUID(user.sub) if _is_uuid(user.sub) else None,
+        user_id=_safe_uuid(user.sub),
         action="document.deleted",
         resource=f"document:{document_id}",
-        metadata={"s3_key": doc.s3_key, "filename": doc.filename},
+        doc_metadata={
+            "s3_key":   doc.s3_key,
+            "filename": doc.filename,
+            "size_bytes": doc.size_bytes,
+        },
         success=True,
     ))
 
 
-# ---------------------------------------------------------------------------
-# SSE helper
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Internal helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _sse_event(event_name: str, data: dict) -> str:
-    """Format a Server-Sent Event with event name and JSON data."""
+def _sse(event_name: str, data: dict) -> str:
+    """Format a Server-Sent Event string."""
     return f"event: {event_name}\ndata: {json.dumps(data)}\n\n"
 
 
-# ---------------------------------------------------------------------------
-# Progress publisher — called by IngestionService to push SSE events
-# (Used internally; not a route)
-# ---------------------------------------------------------------------------
-
-async def publish_progress(upload_token: str, event: dict) -> None:
-    """Push a progress event to the SSE queue for the given upload token."""
-    queue = _PROGRESS_QUEUES.get(upload_token)
-    if queue:
+async def _sse_push(token: str, event: dict) -> None:
+    """Non-blocking push to an SSE queue. Silently drops if queue is full or absent."""
+    q = _SSE_QUEUES.get(token)
+    if q:
         try:
-            queue.put_nowait(event)
+            q.put_nowait(event)
         except asyncio.QueueFull:
-            logger.debug("SSE queue full for token=%s, dropping event", upload_token)
+            logger.debug("SSE queue full for token=%s — event dropped", token)
 
 
-# ---------------------------------------------------------------------------
-# Dependency wiring helpers
-# These bridge the require_role() user to the DB and storage dependencies.
-# ---------------------------------------------------------------------------
-
-async def _get_db_from_user(user: TokenPayload) -> AsyncGenerator[AsyncSession, None]:
-    """Yield a tenant-scoped DB session for the given user."""
-    from app.db.session import get_db
-    async for session in get_db(tenant_id=user.tenant_id):
-        yield session
-
-
-async def _get_storage_from_user(user: TokenPayload) -> S3StorageService:
-    """Return a tenant-scoped S3 storage service."""
-    from app.core.config import settings
-    from app.storage.s3 import TenantStorageConfig
-
-    config = TenantStorageConfig(
-        tenant_id=user.tenant_id,
-        kms_key_arn=settings.s3_default_kms_key_arn,
-    )
-    return S3StorageService(tenant_config=config)
+def _make_progress_cb(upload_token: str, total_bytes: int | None):
+    """
+    Factory: returns an async progress callback that pushes SSE events.
+    Captured in the IngestionService and called after each 5 MB S3 part.
+    """
+    async def _cb(bytes_received: int, bytes_total: int) -> None:
+        total = bytes_total or total_bytes or bytes_received
+        pct = round((bytes_received / total * 100), 1) if total else 0.0
+        await _sse_push(upload_token, {
+            "event":          "upload_progress",
+            "stage":          "uploading",
+            "bytes_received": bytes_received,
+            "bytes_total":    total,
+            "percent":        pct,
+        })
+    return _cb
 
 
-def _extract_client_ip(request: Request) -> str | None:
-    """Extract real client IP from X-Forwarded-For, falling back to direct connection."""
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        # X-Forwarded-For may be a comma-separated list; take the first (client IP)
-        ip = forwarded.split(",")[0].strip()
-        return ip if ip else None
+def _client_ip(request: Request) -> str | None:
+    """
+    Extract real client IP.
+    Trusts the first entry in X-Forwarded-For (set by the load balancer).
+    Falls back to the direct TCP connection's remote address.
+    """
+    fwd = request.headers.get("X-Forwarded-For")
+    if fwd:
+        ip = fwd.split(",")[0].strip()
+        return ip or None
     return request.client.host if request.client else None
 
 
-def _is_uuid(value: str) -> bool:
+def _safe_uuid(value: str) -> uuid.UUID | None:
+    """Safely parse a UUID string; returns None if invalid."""
     try:
-        uuid.UUID(value)
-        return True
+        return uuid.UUID(value)
     except (ValueError, AttributeError):
-        return False
+        return None
