@@ -32,9 +32,22 @@ celery[redis]>=5.4.0         # async task queue with Redis result backend
 kombu>=5.3.0                 # AMQP message routing (RabbitMQ/Redis)
 redis>=5.0.0                 # Redis client (result backend + dev broker)
 
-# Document Parsing
+# Document Parsing — base
 pypdf>=4.2.0                 # PDF text extraction (pure Python, no poppler dep)
 python-docx>=1.1.0           # DOCX text extraction
+
+# Document Parsing — OCR strategy pipeline (app/processing/)
+PyMuPDF>=1.24.0              # fast native PDF text layer (PyMuPDFExtractor)
+unstructured[pdf]>=0.14.0    # on-premise OCR for scanned PDFs (UnstructuredExtractor)
+boto3>=1.34.0                # sync boto3 for AWS Textract (TextractExtractor)
+psycopg2-binary>=2.9.9       # sync PostgreSQL driver for Celery retry scanner
+
+# NLP — Semantic Chunking (app/processing/chunking.py)
+spacy>=3.7.0                 # sentence segmentation (SemanticChunker)
+# After install run: python -m spacy download en_core_web_sm
+
+# OpenAI — Embedding Pipeline (app/processing/embeddings.py)
+openai>=1.30.0               # AsyncOpenAI for batch text-embedding-3-small
 
 # File type detection
 python-magic>=0.4.27         # libmagic bindings for MIME sniffing (Linux/Mac)

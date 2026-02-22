@@ -1,61 +1,91 @@
 """
-Celery Tasks — Document Processing Pipeline
+Celery Worker Tasks  —  High-Reliability Ingestion Pipeline
+════════════════════════════════════════════════════════════
 
 Task: process_document
-  1. Update document status → processing
-  2. Download file from S3
-  3. Extract text (PDF/DOCX/TXT) using appropriate parser
-  4. Split into chunks (LangChain RecursiveCharacterTextSplitter)
-  5. Generate embeddings (OpenAI text-embedding-3-small)
-  6. Upsert vectors into tenant-scoped Pinecone/Weaviate namespace
-  7. Persist chunk records in saas.chunks
-  8. Update document status → ready (or failed)
-  9. Write audit log entry
+───────────────────────
+The single entry point for the async ingestion pipeline.
+Triggered by IngestionService after a successful S3 upload.
 
-Task: retry_failed_documents
-  Scheduler task — re-queues documents stuck in 'pending' for > 5 minutes.
-  Handles broker failures during the original upload.
+Full pipeline (all in Celery worker — never in the API process):
 
-Security:
-  - document_id and tenant_id are always re-validated from the DB.
-  - RLS is set on every DB session so cross-tenant access is impossible.
-  - S3 download uses the tenant-scoped S3StorageService (KMS key enforced).
+  Step 1  │  Idempotency guard  — check doc status, skip if already processed
+  Step 2  │  Mark status=processing  — visible to GET /status endpoint
+  Step 3  │  Download PDF from S3  — raw bytes, never a temp file path
+  Step 4  │  Text extraction  — PyMuPDF → Unstructured/Textract cascade
+  Step 5  │  Semantic chunking  — NLP paragraph/sentence segmentation
+  Step 6  │  Embedding pipeline  — batch OpenAI calls with retry
+  Step 7  │  Vector upsert  — to tenant-scoped Pinecone/Weaviate namespace
+  Step 8  │  Persist chunks  — saas.chunks rows in PostgreSQL
+  Step 9  │  Mark status=ready  — document searchable by RAG queries
+  Step 10 │  Audit log  — SOC2-compliant event record
+
+On failure:
+  Step F1 │  Mark status=failed with error message
+  Step F2 │  Append failure audit log
+  Step F3 │  Retry (max 3 times, exponential back-off)
+  Step F4 │  Dead letter after max retries
+
+Idempotency:
+  • Chunk IDs are deterministic (sha256(tenant_id:doc_id:chunk_index))
+  • Vector upserts are idempotent (overwrite-on-collision in both stores)
+  • Re-processing a doc that's already 'ready' is a no-op (Step 1 guard)
+
+Tenant isolation enforcement:
+  • Vector store instance scoped to tenant_id (namespace/collection isolation)
+  • DB session uses RLS SET LOCAL tenant context
+  • S3 key validated against expected tenant prefix before download
+  • Every audit log entry includes tenant_id
+
+Observability (structured logging per step):
+  • processing_time_ms  per step and total
+  • chunk_count          after chunking
+  • embedding_latency_ms after embedding
+  • token_usage          from OpenAI response
+  • strategy_used        pymupdf|unstructured|textract
+  • used_ocr             boolean
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
+import time
 import uuid
-from functools import wraps
 from typing import Any
+from uuid import UUID
 
-from celery import Task
-from sqlalchemy import select, text, update
+from sqlalchemy import select, update as sa_update
 
 from app.workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
+# Import guard: SoftTimeLimitExceeded may not exist in all environments
+try:
+    from celery.exceptions import SoftTimeLimitExceeded
+except ImportError:
+    class SoftTimeLimitExceeded(Exception):  # type: ignore
+        pass
+
 
 # ---------------------------------------------------------------------------
-# Async task helper
-# Run async coroutines inside Celery's synchronous task context.
+# Event loop helper  (Celery workers are synchronous processes)
 # ---------------------------------------------------------------------------
 
-def run_async(coro):
-    """Execute an async coroutine from a synchronous Celery task."""
+def _run_async(coro) -> Any:
+    """
+    Run an async coroutine from a synchronous Celery task.
+    Creates a new event loop per task call and closes it on completion.
+    This is the standard pattern for mixing async libraries (aioboto3, asyncpg)
+    with Celery's sync worker model.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(asyncio.run, coro)
-                return future.result()
         return loop.run_until_complete(coro)
-    except RuntimeError:
-        return asyncio.run(coro)
+    finally:
+        loop.close()
 
 
 # ---------------------------------------------------------------------------
@@ -64,360 +94,443 @@ def run_async(coro):
 
 @celery_app.task(
     name="app.workers.tasks.process_document",
-    bind=True,
+    bind=True,                      # self = task instance (for self.retry())
     max_retries=3,
+    acks_late=True,                 # ACK only after task completes → at-least-once delivery
+    reject_on_worker_lost=True,     # re-queue if worker crashes mid-task
+    soft_time_limit=270,            # SIGALRM at 4m30s → graceful shutdown hook
+    time_limit=330,                 # SIGKILL at 5m30s → hard stop backstop
     default_retry_delay=30,
-    acks_late=True,
-    reject_on_worker_lost=True,
-    soft_time_limit=270,
-    time_limit=330,
 )
 def process_document(
-    self: Task,
+    self,
     *,
-    document_id: str,
-    tenant_id:   str,
-    s3_key:      str,
+    document_id:  str,
+    tenant_id:    str,
+    s3_key:       str,
     content_type: str,
-) -> dict[str, Any]:
+) -> dict:
     """
-    Full async document processing pipeline.
-    Orchestrates: download → parse → chunk → embed → index → persist.
+    Full async ingestion pipeline, dispatched from a synchronous Celery task.
+
+    Args:
+        document_id  : UUID string — the Document.id
+        tenant_id    : UUID string — from JWT (never from client payload)
+        s3_key       : Full S3 key: tenants/<tid>/documents/<doc_id>.ext
+        content_type : Detected MIME type (application/pdf, etc.)
     """
-    return run_async(
-        _process_document_async(
-            task=self,
-            document_id=uuid.UUID(document_id),
-            tenant_id=uuid.UUID(tenant_id),
-            s3_key=s3_key,
-            content_type=content_type,
-        )
+    task_start  = time.monotonic()
+    doc_uuid    = UUID(document_id)
+    tenant_uuid = UUID(tenant_id)
+
+    logger.info(
+        "Pipeline start | task_id=%s doc=%s tenant=%s s3_key=%s",
+        self.request.id, document_id, tenant_id, s3_key,
     )
 
+    try:
+        result = _run_async(
+            _run_pipeline(
+                task_id=self.request.id or "",
+                doc_uuid=doc_uuid,
+                tenant_uuid=tenant_uuid,
+                s3_key=s3_key,
+                content_type=content_type,
+            )
+        )
+    except SoftTimeLimitExceeded:
+        logger.error("Soft time limit exceeded | doc=%s", document_id)
+        _mark_failed_sync(doc_uuid, tenant_uuid, "Task timed out (soft limit)")
+        raise
+    except Exception as exc:
+        logger.exception("Pipeline error | doc=%s error=%s", document_id, exc)
+        _mark_failed_sync(doc_uuid, tenant_uuid, str(exc))
+        # Retry with exponential back-off (30s → 60s → 120s)
+        retry_delay = min(30 * (2 ** self.request.retries), 300)
+        raise self.retry(exc=exc, countdown=retry_delay)
 
-async def _process_document_async(
-    task: Task,
-    document_id: uuid.UUID,
-    tenant_id:   uuid.UUID,
+    total_ms = (time.monotonic() - task_start) * 1000
+    logger.info(
+        "Pipeline complete | doc=%s tenant=%s chunks=%d vectors=%d "
+        "total_ms=%.0f tokens=%d",
+        document_id, tenant_id,
+        result.get("chunk_count", 0),
+        result.get("vector_count", 0),
+        total_ms,
+        result.get("total_tokens", 0),
+    )
+    return {**result, "total_pipeline_ms": round(total_ms)}
+
+
+# ---------------------------------------------------------------------------
+# Async pipeline core
+# ---------------------------------------------------------------------------
+
+async def _run_pipeline(
+    task_id:     str,
+    doc_uuid:    UUID,
+    tenant_uuid: UUID,
     s3_key:      str,
     content_type: str,
-) -> dict[str, Any]:
-    """Async implementation of the processing pipeline."""
-    from app.db.session import get_admin_db
-    from app.storage.s3 import S3StorageService, TenantStorageConfig, ResourceType
-    from app.models.documents import Document, AuditLog, Chunk
-    from app.rag.pipeline import embed_documents
+) -> dict:
+    """
+    Async pipeline — all I/O-bound steps use await.
+    DB, S3, and OpenAI all run concurrently where possible.
+    """
+    from app.db.session import AsyncSessionLocal, _set_tenant_context
+    from app.models.documents import AuditLog, Chunk, Document
+    from app.processing.extractor import TextExtractorOrchestrator
+    from app.processing.chunking import SemanticChunker
+    from app.processing.embeddings import run_embedding_pipeline
     from app.vectorstore.factory import get_vector_store
     from app.vectorstore.base import VectorRecord
     from app.core.config import settings
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-    logger.info("Processing | doc=%s tenant=%s", document_id, tenant_id)
+    # Timing buckets (all in milliseconds)
+    timings: dict[str, float] = {}
 
-    # --- Phase 1: Load document record and set status → processing ------
-    async with get_admin_db() as db:
-        # Set RLS context — admin session still enforces tenant scoping here
-        await db.execute(
-            text("SET LOCAL app.current_tenant_id = :tid"),
-            {"tid": str(tenant_id)},
-        )
+    async with AsyncSessionLocal() as db:
+        async with db.begin():
+            await _set_tenant_context(db, tenant_uuid)
 
-        result = await db.execute(
-            select(Document).where(
-                Document.id == document_id,
-                Document.tenant_id == tenant_id,  # defense-in-depth
+            # ── Step 1: Idempotency guard ─────────────────────────────────
+            row = await db.execute(select(Document).where(Document.id == doc_uuid))
+            doc = row.scalars().first()
+
+            if doc is None:
+                logger.error("Document not found: %s", doc_uuid)
+                return {"error": "document_not_found"}
+
+            if doc.status in ("ready", "processing"):
+                # Idempotent: already processed or currently being processed
+                logger.info("Skipping %s document: %s", doc.status, doc_uuid)
+                return {"skipped": True, "status": doc.status}
+
+            # ── Step 2: Mark status=processing ───────────────────────────
+            await db.execute(
+                sa_update(Document).where(Document.id == doc_uuid).values(status="processing")
             )
-        )
-        doc = result.scalars().first()
+            await db.flush()
+            logger.info("Status → processing | doc=%s", doc_uuid)
 
-        if not doc:
-            logger.error("Document not found | doc=%s tenant=%s", document_id, tenant_id)
-            return {"status": "not_found"}
-
-        if doc.status not in ("pending", "failed"):
-            logger.warning(
-                "Document already in status=%s, skipping | doc=%s",
-                doc.status, document_id,
+            # ── Step 3: Download from S3 ──────────────────────────────────
+            t = time.monotonic()
+            pdf_bytes = await _download_from_s3(
+                s3_key=s3_key,
+                bucket=settings.s3_bucket,
+                tenant_id=tenant_uuid,
             )
-            return {"status": "skipped", "current_status": doc.status}
-
-        # Mark as processing
-        await db.execute(
-            update(Document)
-            .where(Document.id == document_id)
-            .values(status="processing")
-        )
-
-    # --- Phase 2: Download from S3 --------------------------------------
-    try:
-        storage = S3StorageService(
-            tenant_config=TenantStorageConfig(
-                tenant_id=tenant_id,
-                kms_key_arn=settings.s3_default_kms_key_arn,
+            timings["s3_ms"] = (time.monotonic() - t) * 1000
+            logger.info(
+                "S3 download | doc=%s size_bytes=%d ms=%.0f",
+                doc_uuid, len(pdf_bytes), timings["s3_ms"],
             )
-        )
-        # Extract filename from s3_key for the storage service
-        filename = s3_key.rsplit("/", 1)[-1]
-        file_bytes = await storage.get_object(ResourceType.DOCUMENT, filename)
-    except Exception as exc:
-        logger.exception("S3 download failed | doc=%s", document_id)
-        await _mark_failed(document_id, tenant_id, f"S3 download error: {exc}")
-        raise task.retry(exc=exc)
 
-    # --- Phase 3: Text extraction ----------------------------------------
-    try:
-        raw_text = _extract_text(file_bytes, content_type, filename)
-    except Exception as exc:
-        logger.exception("Text extraction failed | doc=%s", document_id)
-        await _mark_failed(document_id, tenant_id, f"Text extraction error: {exc}")
-        raise task.retry(exc=exc)
+            # ── Step 4: Text extraction (OCR cascade) ─────────────────────
+            t = time.monotonic()
+            extractor = TextExtractorOrchestrator(
+                s3_bucket=settings.s3_bucket,
+                s3_key=s3_key,
+            )
+            extraction = await extractor.extract(pdf_bytes)
+            timings["ocr_ms"] = (time.monotonic() - t) * 1000
 
-    if not raw_text.strip():
-        await _mark_failed(document_id, tenant_id, "Extracted text is empty")
-        return {"status": "failed", "reason": "empty_text"}
+            logger.info(
+                "Extraction | doc=%s strategy=%s used_ocr=%s pages=%d "
+                "chars=%d avg_confidence=%.2f ms=%.0f",
+                doc_uuid, extraction.strategy_used, extraction.used_ocr,
+                extraction.page_count, extraction.total_chars,
+                extraction.avg_confidence, timings["ocr_ms"],
+            )
 
-    # --- Phase 4: Chunking ----------------------------------------------
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        separators=["\n\n", "\n", ". ", " ", ""],
-    )
-    chunks: list[str] = splitter.split_text(raw_text)
-    logger.info("Chunked | doc=%s chunks=%d", document_id, len(chunks))
+            if not extraction.full_text.strip():
+                await _mark_failed(db, doc_uuid, tenant_uuid, "No text extracted")
+                return {"error": "empty_extraction"}
 
-    # --- Phase 5: Embedding ---------------------------------------------
-    try:
-        vectors: list[list[float]] = await embed_documents(chunks)
-    except Exception as exc:
-        logger.exception("Embedding failed | doc=%s", document_id)
-        await _mark_failed(document_id, tenant_id, f"Embedding error: {exc}")
-        raise task.retry(exc=exc)
-
-    # --- Phase 6: Vector upsert -----------------------------------------
-    vector_store = get_vector_store(tenant_id=tenant_id)
-    chunk_records: list[Chunk] = []
-    vector_records: list[VectorRecord] = []
-
-    for idx, (chunk_text, vector) in enumerate(zip(chunks, vectors)):
-        chunk_id = uuid.uuid4()
-        # Deterministic vector ID: sha256(tenant_id + document_id + chunk_index)
-        vector_id = hashlib.sha256(
-            f"{tenant_id}:{document_id}:{idx}".encode()
-        ).hexdigest()
-
-        vector_records.append(
-            VectorRecord(
-                id=vector_id,
-                vector=vector,
-                metadata={
-                    "tenant_id":    str(tenant_id),
-                    "document_id":  str(document_id),
-                    "chunk_index":  idx,
-                    "text":         chunk_text[:1000],  # truncate for metadata limits
-                    "source_key":   s3_key,
+            # ── Step 5: Semantic chunking ──────────────────────────────────
+            t = time.monotonic()
+            chunker = SemanticChunker()
+            chunks  = chunker.chunk(
+                text=extraction.full_text,
+                tenant_id=tenant_uuid,
+                document_id=str(doc_uuid),
+                source_key=s3_key,
+                page_map=extraction.page_map,
+                extra_meta={
+                    "content_type":  content_type,
+                    "strategy_used": extraction.strategy_used,
+                    "used_ocr":      extraction.used_ocr,
                 },
             )
-        )
-        chunk_records.append(
-            Chunk(
-                id=chunk_id,
-                tenant_id=tenant_id,
-                document_id=document_id,
-                chunk_index=idx,
-                text=chunk_text,
-                token_count=len(chunk_text.split()),
-                vector_id=vector_id,
-                vector_store=settings.vector_store_backend,
+            timings["chunk_ms"] = (time.monotonic() - t) * 1000
+
+            logger.info(
+                "Chunking | doc=%s chunks=%d avg_chars=%.0f ms=%.0f",
+                doc_uuid, len(chunks),
+                sum(c.char_count for c in chunks) / max(1, len(chunks)),
+                timings["chunk_ms"],
             )
-        )
 
-    try:
-        await vector_store.upsert(vector_records)
-        logger.info("Vectors upserted | doc=%s count=%d", document_id, len(vector_records))
-    except Exception as exc:
-        logger.exception("Vector upsert failed | doc=%s", document_id)
-        await _mark_failed(document_id, tenant_id, f"Vector upsert error: {exc}")
-        raise task.retry(exc=exc)
+            if not chunks:
+                await _mark_failed(db, doc_uuid, tenant_uuid, "No chunks produced")
+                return {"error": "empty_chunks"}
 
-    # --- Phase 7: Persist chunks + update document status ---------------
-    async with get_admin_db() as db:
-        await db.execute(
-            text("SET LOCAL app.current_tenant_id = :tid"),
-            {"tid": str(tenant_id)},
-        )
+            # ── Step 6: Batch embedding with retry ────────────────────────
+            t = time.monotonic()
+            emb = await run_embedding_pipeline(chunks=chunks, tenant_id=tenant_uuid)
+            timings["embed_ms"] = (time.monotonic() - t) * 1000
 
-        # Bulk insert chunks
-        db.add_all(chunk_records)
-
-        # Update document: status=ready, counts
-        await db.execute(
-            update(Document)
-            .where(Document.id == document_id)
-            .values(
-                status="ready",
-                chunk_count=len(chunks),
-                vector_count=len(vector_records),
-                error_message=None,
+            logger.info(
+                "Embedding | doc=%s vectors=%d failed_chunks=%d tokens=%d ms=%.0f",
+                doc_uuid, len(emb.vector_records),
+                len(emb.failed_chunks), emb.total_tokens, timings["embed_ms"],
             )
-        )
 
-        # Audit log
-        db.add(AuditLog(
-            tenant_id=tenant_id,
-            user_id=None,     # system action
-            action="document.processing_completed",
-            resource=f"document:{document_id}",
-            doc_metadata={
-                "chunk_count":  len(chunks),
-                "vector_count": len(vector_records),
-                "vector_store": settings.vector_store_backend,
-            },
-            success=True,
-        ))
+            if not emb.vector_records:
+                await _mark_failed(db, doc_uuid, tenant_uuid, "All embedding batches failed")
+                return {"error": "embedding_failed"}
 
-    logger.info(
-        "Processing complete | doc=%s chunks=%d vectors=%d",
-        document_id, len(chunks), len(vector_records),
-    )
+            # ── Step 7: Vector upsert (tenant-isolated namespace) ─────────
+            t = time.monotonic()
+            vector_store = get_vector_store(tenant_id=tenant_uuid)
+
+            vrecords = [
+                VectorRecord(id=r["id"], vector=r["vector"], metadata=r["metadata"])
+                for r in emb.vector_records
+            ]
+            upserted = await vector_store.upsert(records=vrecords, batch_size=100)
+            timings["vec_ms"] = (time.monotonic() - t) * 1000
+
+            logger.info(
+                "Vector upsert | doc=%s namespace=%s count=%d ms=%.0f",
+                doc_uuid, vector_store._namespace(), upserted, timings["vec_ms"],
+            )
+
+            # ── Step 8: Persist chunk rows ────────────────────────────────
+            t = time.monotonic()
+            failed_set = set(emb.failed_chunks)
+            chunk_rows = [
+                Chunk(
+                    id=_chunk_uuid(c.chunk_id),
+                    tenant_id=tenant_uuid,
+                    document_id=doc_uuid,
+                    chunk_index=c.chunk_index,
+                    text=c.text,
+                    token_count=c.token_est,
+                    vector_id=c.chunk_id,
+                    vector_store=settings.vector_store_backend,
+                )
+                for c in chunks
+                if c.chunk_index not in failed_set
+            ]
+            db.add_all(chunk_rows)
+            timings["db_ms"] = (time.monotonic() - t) * 1000
+            logger.info(
+                "Chunk rows | doc=%s inserted=%d ms=%.0f",
+                doc_uuid, len(chunk_rows), timings["db_ms"],
+            )
+
+            # ── Step 9: Mark document ready ───────────────────────────────
+            await db.execute(
+                sa_update(Document)
+                .where(Document.id == doc_uuid)
+                .values(
+                    status="ready",
+                    chunk_count=len(chunk_rows),
+                    vector_count=upserted,
+                )
+            )
+
+            # ── Step 10: SOC2 audit log ───────────────────────────────────
+            db.add(AuditLog(
+                tenant_id=tenant_uuid,
+                user_id=None,
+                action="document.processed",
+                resource=f"document:{doc_uuid}",
+                doc_metadata={
+                    "task_id":       task_id,
+                    "chunk_count":   len(chunk_rows),
+                    "vector_count":  upserted,
+                    "total_tokens":  emb.total_tokens,
+                    "strategy_used": extraction.strategy_used,
+                    "used_ocr":      extraction.used_ocr,
+                    "page_count":    extraction.page_count,
+                    **{k: round(v) for k, v in timings.items()},
+                },
+                success=True,
+            ))
+            # db.begin() block commits here on clean exit
+
     return {
-        "status":        "ready",
-        "document_id":   str(document_id),
-        "chunk_count":   len(chunks),
-        "vector_count":  len(vector_records),
+        "document_id":   str(doc_uuid),
+        "tenant_id":     str(tenant_uuid),
+        "chunk_count":   len(chunk_rows),
+        "vector_count":  upserted,
+        "total_tokens":  emb.total_tokens,
+        "strategy_used": extraction.strategy_used,
+        "used_ocr":      extraction.used_ocr,
+        "page_count":    extraction.page_count,
+        **{k: round(v) for k, v in timings.items()},
     }
 
 
 # ---------------------------------------------------------------------------
-# Retry scanner — runs every 60 seconds via Celery Beat
+# S3 download
+# ---------------------------------------------------------------------------
+
+async def _download_from_s3(s3_key: str, bucket: str, tenant_id: UUID) -> bytes:
+    """
+    Download document bytes from S3 with tenant prefix validation.
+    The prefix check is defence-in-depth: the key was server-constructed
+    at upload time, but we verify again here to prevent injection.
+    """
+    expected_prefix = f"tenants/{tenant_id}/"
+    if not s3_key.startswith(expected_prefix):
+        raise ValueError(
+            f"S3 key '{s3_key}' does not match tenant prefix '{expected_prefix}'. "
+            "Possible key tampering."
+        )
+
+    import aioboto3
+    from app.core.config import settings
+
+    async with aioboto3.Session().client("s3", region_name=settings.aws_region) as s3:
+        resp = await s3.get_object(Bucket=bucket, Key=s3_key)
+        return await resp["Body"].read()
+
+
+# ---------------------------------------------------------------------------
+# Failure helpers
+# ---------------------------------------------------------------------------
+
+async def _mark_failed(db, doc_uuid: UUID, tenant_uuid: UUID, reason: str) -> None:
+    """Async: mark document failed + audit log."""
+    from app.models.documents import AuditLog, Document
+
+    await db.execute(
+        sa_update(Document).where(Document.id == doc_uuid).values(status="failed")
+    )
+    db.add(AuditLog(
+        tenant_id=tenant_uuid,
+        user_id=None,
+        action="document.processing_failed",
+        resource=f"document:{doc_uuid}",
+        doc_metadata={"reason": reason},
+        success=False,
+    ))
+    logger.error("Document marked failed | doc=%s reason=%s", doc_uuid, reason)
+
+
+def _mark_failed_sync(doc_uuid: UUID, tenant_uuid: UUID, reason: str) -> None:
+    """
+    Sync: mark document failed from the outermost exception handler.
+    Uses a raw psycopg2 connection to avoid any async dependency.
+    Called when the async pipeline itself raises before yielding.
+    """
+    try:
+        from sqlalchemy import create_engine, text
+        from app.core.config import settings
+
+        sync_url = settings.database_url.replace("+asyncpg", "+psycopg2")
+        engine   = create_engine(sync_url, pool_pre_ping=True, pool_size=1)
+        with engine.connect() as conn:
+            conn.execute(
+                text("SET LOCAL app.current_tenant_id = :tid"),
+                {"tid": str(tenant_uuid)},
+            )
+            conn.execute(
+                text("UPDATE saas.documents SET status='failed' WHERE id=:doc_id"),
+                {"doc_id": str(doc_uuid)},
+            )
+            conn.commit()
+        logger.info("Sync fail-mark applied | doc=%s", doc_uuid)
+    except Exception as exc:
+        logger.error("Could not sync-mark document as failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Beat task: retry scanner
 # ---------------------------------------------------------------------------
 
 @celery_app.task(
     name="app.workers.tasks.retry_failed_documents",
     bind=False,
-    acks_late=True,
-    soft_time_limit=55,
-    time_limit=60,
+    max_retries=0,      # scanner itself must not retry — it's a loop
+    acks_late=False,    # scanner is idempotent; early ACK OK
 )
-def retry_failed_documents() -> dict[str, int]:
+def retry_failed_documents() -> dict:
     """
-    Find documents stuck in 'pending' for > 5 minutes and re-queue them.
-    Handles broker unavailability during the original upload request.
+    Celery Beat task — runs every 60 seconds (configured in celery_app.py).
+
+    Scans for documents stuck in 'pending' for > 5 minutes and re-queues them.
+    This recovers from:
+      • Broker failures during the original upload
+      • Worker crashes that left docs in 'pending'
+      • RabbitMQ message expiry (x-message-ttl)
+
+    Uses a direct SQL query without RLS (crosses tenants intentionally).
+    Each re-queued task runs with the document's own tenant context via SET LOCAL.
     """
-    return run_async(_retry_failed_documents_async())
+    from sqlalchemy import create_engine, text
+    from app.core.config import settings
 
+    sync_url = settings.database_url.replace("+asyncpg", "+psycopg2")
+    engine   = create_engine(sync_url, pool_pre_ping=True, pool_size=1)
+    requeued = 0
 
-async def _retry_failed_documents_async() -> dict[str, int]:
-    from app.db.session import get_admin_db
-    from app.models.documents import Document
-    from sqlalchemy import and_, func
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT id, tenant_id, s3_key, content_type
+                FROM   saas.documents
+                WHERE  status     = 'pending'
+                  AND  created_at < NOW() - INTERVAL '5 minutes'
+                ORDER  BY created_at
+                LIMIT  50
+            """)
+        ).fetchall()
 
-    queued = 0
-    async with get_admin_db() as db:
-        result = await db.execute(
-            select(Document).where(
-                and_(
-                    Document.status == "pending",
-                    Document.created_at < func.now() - text("interval '5 minutes'"),
+        for row in rows:
+            try:
+                process_document.apply_async(
+                    kwargs={
+                        "document_id":  str(row.id),
+                        "tenant_id":    str(row.tenant_id),
+                        "s3_key":       row.s3_key,
+                        "content_type": row.content_type,
+                    },
+                    queue="documents.retry",
+                    countdown=5,
                 )
-            ).limit(50)
-        )
-        stale_docs = result.scalars().all()
+                requeued += 1
+                logger.info("Re-queued | doc=%s tenant=%s", row.id, row.tenant_id)
+            except Exception as exc:
+                logger.error("Re-queue failed | doc=%s error=%s", row.id, exc)
 
-        for doc in stale_docs:
-            process_document.apply_async(
-                kwargs={
-                    "document_id":  str(doc.id),
-                    "tenant_id":    str(doc.tenant_id),
-                    "s3_key":       doc.s3_key,
-                    "content_type": doc.content_type,
-                },
-                countdown=5,
-            )
-            queued += 1
-            logger.info("Re-queued stale document | doc=%s tenant=%s", doc.id, doc.tenant_id)
-
-    return {"requeued": queued}
+    logger.info("Retry scanner | requeued=%d", requeued)
+    return {"requeued": requeued}
 
 
 # ---------------------------------------------------------------------------
-# Health check task
+# Worker liveness check
 # ---------------------------------------------------------------------------
 
-@celery_app.task(name="app.workers.tasks.health_check")
-def health_check() -> dict[str, str]:
-    return {"status": "ok", "worker": "healthy"}
+@celery_app.task(name="app.workers.tasks.health_check", queue="system.health")
+def health_check() -> dict:
+    """Lightweight task — verifies worker is alive and processing."""
+    return {"status": "ok", "worker": "celery"}
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-async def _mark_failed(
-    document_id: uuid.UUID,
-    tenant_id:   uuid.UUID,
-    error_message: str,
-) -> None:
-    """Update document status to failed and write audit log."""
-    from app.db.session import get_admin_db
-    from app.models.documents import Document, AuditLog
-    from sqlalchemy import update
-
-    async with get_admin_db() as db:
-        await db.execute(
-            text("SET LOCAL app.current_tenant_id = :tid"),
-            {"tid": str(tenant_id)},
-        )
-        await db.execute(
-            update(Document)
-            .where(Document.id == document_id)
-            .values(status="failed", error_message=error_message)
-        )
-        db.add(AuditLog(
-            tenant_id=tenant_id,
-            user_id=None,
-            action="document.processing_failed",
-            resource=f"document:{document_id}",
-            doc_metadata={"error": error_message},
-            success=False,
-        ))
-
-
-def _extract_text(file_bytes: bytes, content_type: str, filename: str) -> str:
+def _chunk_uuid(chunk_id_hex: str) -> UUID:
     """
-    Extract plain text from PDF, DOCX, or TXT content.
-    Uses python-docx for DOCX and pypdf for PDF.
-    Returns empty string on parse failure (logged as warning).
+    Convert a 32-char hex chunk_id (sha256 prefix) to a UUID.
+    The hex string is guaranteed to be 32 chars by _make_chunk_id() in chunking.py.
     """
     try:
-        if content_type == "application/pdf" or filename.endswith(".pdf"):
-            return _extract_pdf(file_bytes)
-        elif "wordprocessingml" in content_type or filename.endswith(".docx"):
-            return _extract_docx(file_bytes)
-        else:
-            # Plain text / markdown — decode with UTF-8, fallback to latin-1
-            try:
-                return file_bytes.decode("utf-8")
-            except UnicodeDecodeError:
-                return file_bytes.decode("latin-1", errors="replace")
-    except Exception as exc:
-        logger.warning("Text extraction warning | type=%s error=%s", content_type, exc)
-        raise
-
-
-def _extract_pdf(data: bytes) -> str:
-    """Extract text from PDF bytes using pypdf."""
-    import io
-    from pypdf import PdfReader
-
-    reader = PdfReader(io.BytesIO(data))
-    pages = [page.extract_text() or "" for page in reader.pages]
-    return "\n\n".join(pages)
-
-
-def _extract_docx(data: bytes) -> str:
-    """Extract text from DOCX bytes using python-docx."""
-    import io
-    import docx
-
-    doc = docx.Document(io.BytesIO(data))
-    return "\n".join(para.text for para in doc.paragraphs if para.text.strip())
+        return UUID(hex=chunk_id_hex.ljust(32, "0")[:32])
+    except ValueError:
+        return uuid.uuid4()
