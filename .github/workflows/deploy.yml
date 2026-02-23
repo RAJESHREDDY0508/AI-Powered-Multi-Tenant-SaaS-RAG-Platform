@@ -8,6 +8,12 @@
 #   3. Pushes images to AWS ECR
 #   4. Runs database migrations
 #   5. Deploys updated containers to ECS
+#
+# Configuration values are read from EITHER:
+#   - GitHub repository Secrets  (Settings → Secrets → Actions)
+#   - GitHub repository Variables (Settings → Variables → Actions)
+# Secrets take priority. This way the workflow works regardless
+# of which storage type you chose when following the setup guide.
 ##############################################################
 
 name: Deploy to AWS
@@ -68,11 +74,13 @@ jobs:
         env:
           DATABASE_URL:         postgresql+asyncpg://rag:rag@localhost:5432/ragplatform_test
           REDIS_URL:            redis://localhost:6379/0
-          AUTH_ISSUER:          https://test.auth0.com/
-          AUTH_AUDIENCE:        test-audience
+          AUTH_ISSUER:          https://test.auth.example.com/
+          AUTH_AUDIENCE:        test-api-audience
           OPENAI_API_KEY:       sk-test-placeholder
           S3_BUCKET:            test-bucket
           AWS_REGION:           us-east-1
+          AWS_ACCESS_KEY_ID:    test
+          AWS_SECRET_ACCESS_KEY: test
           VECTOR_STORE_BACKEND: weaviate
           WEAVIATE_HOST:        localhost
           WEAVIATE_PORT:        "8080"
@@ -98,7 +106,7 @@ jobs:
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ vars.AWS_REGION }}
+          aws-region:            ${{ secrets.AWS_REGION || vars.AWS_REGION }}
 
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
@@ -114,8 +122,8 @@ jobs:
           target:     api
           push:       true
           tags: |
-            ${{ vars.ECR_API_URL }}:${{ github.sha }}
-            ${{ vars.ECR_API_URL }}:latest
+            ${{ secrets.ECR_API_URL || vars.ECR_API_URL }}:${{ github.sha }}
+            ${{ secrets.ECR_API_URL || vars.ECR_API_URL }}:latest
           cache-from: type=gha,scope=api
           cache-to:   type=gha,scope=api,mode=max
 
@@ -127,8 +135,8 @@ jobs:
           build-args: |
             NEXT_PUBLIC_APP_VERSION=${{ github.sha }}
           tags: |
-            ${{ vars.ECR_FRONTEND_URL }}:${{ github.sha }}
-            ${{ vars.ECR_FRONTEND_URL }}:latest
+            ${{ secrets.ECR_FRONTEND_URL || vars.ECR_FRONTEND_URL }}:${{ github.sha }}
+            ${{ secrets.ECR_FRONTEND_URL || vars.ECR_FRONTEND_URL }}:latest
           cache-from: type=gha,scope=frontend
           cache-to:   type=gha,scope=frontend,mode=max
 
@@ -146,18 +154,25 @@ jobs:
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ vars.AWS_REGION }}
+          aws-region:            ${{ secrets.AWS_REGION || vars.AWS_REGION }}
 
       - name: Run database migrations
+        env:
+          ECS_CLUSTER:            ${{ secrets.ECS_CLUSTER            || vars.ECS_CLUSTER }}
+          ECS_MIGRATION_TASK_DEF: ${{ secrets.ECS_MIGRATION_TASK_DEF || vars.ECS_MIGRATION_TASK_DEF }}
+          ECS_PRIVATE_SUBNET:     ${{ secrets.ECS_PRIVATE_SUBNET     || vars.ECS_PRIVATE_SUBNET }}
+          ECS_SECURITY_GROUP:     ${{ secrets.ECS_SECURITY_GROUP     || vars.ECS_SECURITY_GROUP }}
+          ECR_API_URL:            ${{ secrets.ECR_API_URL            || vars.ECR_API_URL }}
+          IMAGE_TAG:              ${{ github.sha }}
         run: |
           echo "Starting migration task in ECS..."
 
           TASK_ARN=$(aws ecs run-task \
-            --cluster  "${{ vars.ECS_CLUSTER }}" \
-            --task-definition "${{ vars.ECS_MIGRATION_TASK_DEF }}" \
+            --cluster  "$ECS_CLUSTER" \
+            --task-definition "$ECS_MIGRATION_TASK_DEF" \
             --launch-type FARGATE \
-            --network-configuration "awsvpcConfiguration={subnets=[${{ vars.ECS_PRIVATE_SUBNET }}],securityGroups=[${{ vars.ECS_SECURITY_GROUP }}],assignPublicIp=DISABLED}" \
-            --overrides "{\"containerOverrides\":[{\"name\":\"migration\",\"image\":\"${{ vars.ECR_API_URL }}:${{ github.sha }}\"}]}" \
+            --network-configuration "awsvpcConfiguration={subnets=[$ECS_PRIVATE_SUBNET],securityGroups=[$ECS_SECURITY_GROUP],assignPublicIp=DISABLED}" \
+            --overrides "{\"containerOverrides\":[{\"name\":\"migration\",\"image\":\"$ECR_API_URL:$IMAGE_TAG\"}]}" \
             --query 'tasks[0].taskArn' \
             --output text)
 
@@ -165,11 +180,11 @@ jobs:
           echo "Waiting for migrations to complete..."
 
           aws ecs wait tasks-stopped \
-            --cluster "${{ vars.ECS_CLUSTER }}" \
+            --cluster "$ECS_CLUSTER" \
             --tasks   "$TASK_ARN"
 
           EXIT_CODE=$(aws ecs describe-tasks \
-            --cluster "${{ vars.ECS_CLUSTER }}" \
+            --cluster "$ECS_CLUSTER" \
             --tasks   "$TASK_ARN" \
             --query   'tasks[0].containers[0].exitCode' \
             --output  text)
@@ -201,13 +216,23 @@ jobs:
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ vars.AWS_REGION }}
+          aws-region:            ${{ secrets.AWS_REGION || vars.AWS_REGION }}
+
+      # Resolve all config values once into env vars for this job
+      - name: Resolve configuration
+        run: |
+          echo "ECS_CLUSTER=${{ secrets.ECS_CLUSTER || vars.ECS_CLUSTER }}"                   >> $GITHUB_ENV
+          echo "ECS_API_SERVICE=${{ secrets.ECS_API_SERVICE || vars.ECS_API_SERVICE }}"       >> $GITHUB_ENV
+          echo "ECS_WORKER_SERVICE=${{ secrets.ECS_WORKER_SERVICE || vars.ECS_WORKER_SERVICE }}" >> $GITHUB_ENV
+          echo "ECS_FRONTEND_SERVICE=${{ secrets.ECS_FRONTEND_SERVICE || vars.ECS_FRONTEND_SERVICE }}" >> $GITHUB_ENV
+          echo "ECR_API_URL=${{ secrets.ECR_API_URL || vars.ECR_API_URL }}"                   >> $GITHUB_ENV
+          echo "ECR_FRONTEND_URL=${{ secrets.ECR_FRONTEND_URL || vars.ECR_FRONTEND_URL }}"   >> $GITHUB_ENV
 
       # ── Deploy API ─────────────────────────────────────────
       - name: Get current API task definition
         run: |
           aws ecs describe-task-definition \
-            --task-definition "${{ vars.ECS_CLUSTER }}-api" \
+            --task-definition "${{ env.ECS_CLUSTER }}-api" \
             --query taskDefinition \
             --output json > api-task-def.json
 
@@ -217,21 +242,21 @@ jobs:
         with:
           task-definition: api-task-def.json
           container-name:  api
-          image:           ${{ vars.ECR_API_URL }}:${{ github.sha }}
+          image:           ${{ env.ECR_API_URL }}:${{ github.sha }}
 
       - name: Deploy API service
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
-          task-definition:             ${{ steps.api-task-def.outputs.task-definition }}
-          service:                     ${{ vars.ECS_API_SERVICE }}
-          cluster:                     ${{ vars.ECS_CLUSTER }}
-          wait-for-service-stability:  true
+          task-definition:            ${{ steps.api-task-def.outputs.task-definition }}
+          service:                    ${{ env.ECS_API_SERVICE }}
+          cluster:                    ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
 
       # ── Deploy Worker ──────────────────────────────────────
       - name: Get current Worker task definition
         run: |
           aws ecs describe-task-definition \
-            --task-definition "${{ vars.ECS_CLUSTER }}-worker" \
+            --task-definition "${{ env.ECS_CLUSTER }}-worker" \
             --query taskDefinition \
             --output json > worker-task-def.json
 
@@ -241,21 +266,21 @@ jobs:
         with:
           task-definition: worker-task-def.json
           container-name:  worker
-          image:           ${{ vars.ECR_API_URL }}:${{ github.sha }}
+          image:           ${{ env.ECR_API_URL }}:${{ github.sha }}
 
       - name: Deploy Worker service
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
-          task-definition:             ${{ steps.worker-task-def.outputs.task-definition }}
-          service:                     ${{ vars.ECS_WORKER_SERVICE }}
-          cluster:                     ${{ vars.ECS_CLUSTER }}
-          wait-for-service-stability:  false
+          task-definition:            ${{ steps.worker-task-def.outputs.task-definition }}
+          service:                    ${{ env.ECS_WORKER_SERVICE }}
+          cluster:                    ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: false
 
       # ── Deploy Frontend ────────────────────────────────────
       - name: Get current Frontend task definition
         run: |
           aws ecs describe-task-definition \
-            --task-definition "${{ vars.ECS_CLUSTER }}-frontend" \
+            --task-definition "${{ env.ECS_CLUSTER }}-frontend" \
             --query taskDefinition \
             --output json > frontend-task-def.json
 
@@ -265,15 +290,15 @@ jobs:
         with:
           task-definition: frontend-task-def.json
           container-name:  frontend
-          image:           ${{ vars.ECR_FRONTEND_URL }}:${{ github.sha }}
+          image:           ${{ env.ECR_FRONTEND_URL }}:${{ github.sha }}
 
       - name: Deploy Frontend service
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
-          task-definition:             ${{ steps.frontend-task-def.outputs.task-definition }}
-          service:                     ${{ vars.ECS_FRONTEND_SERVICE }}
-          cluster:                     ${{ vars.ECS_CLUSTER }}
-          wait-for-service-stability:  true
+          task-definition:            ${{ steps.frontend-task-def.outputs.task-definition }}
+          service:                    ${{ env.ECS_FRONTEND_SERVICE }}
+          cluster:                    ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
 
       # ── Summary ───────────────────────────────────────────
       - name: Print deployment summary
