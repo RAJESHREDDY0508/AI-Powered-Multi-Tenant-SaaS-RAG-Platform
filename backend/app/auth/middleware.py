@@ -91,10 +91,18 @@ class _JWKSCache:
     def __init__(self) -> None:
         self._store: dict[str, tuple[dict, float]] = {}   # issuer → (jwks, fetched_at)
 
-    async def get_signing_key(self, token: str) -> object:
+    async def get_signing_key(self, token: str, issuer: str | None = None) -> object:
         """
         Resolve the RSA public key for the given token's kid.
         Returns a python-jose public key object.
+
+        Args:
+            token:  The raw JWT string.
+            issuer: The OIDC issuer URL whose JWKS to fetch.
+                    Defaults to ``settings.auth_issuer`` when not supplied.
+                    Callers (e.g. JWTDecoder) should pass their own configured
+                    issuer so that the cache key matches what was pre-populated
+                    in tests and avoids unintended network calls.
         """
         try:
             header = jwt.get_unverified_header(token)
@@ -105,7 +113,7 @@ class _JWKSCache:
             ) from exc
 
         kid    = header.get("kid")
-        issuer = settings.auth_issuer
+        issuer = issuer or settings.auth_issuer
 
         for attempt in range(2):
             if attempt == 1:
@@ -227,7 +235,11 @@ class JWTDecoder:
         token = credentials.credentials
 
         # Step 2: Resolve signing key
-        signing_key = await self._cache.get_signing_key(token)
+        # Pass self._issuer explicitly so the cache lookup uses the same key
+        # that was configured at construction time (critical for test isolation —
+        # the test fixture pre-populates the cache under TEST_ISSUER, which may
+        # differ from settings.auth_issuer if the env var is not overridden).
+        signing_key = await self._cache.get_signing_key(token, issuer=self._issuer)
 
         # Step 3: Decode + verify all claims
         try:
