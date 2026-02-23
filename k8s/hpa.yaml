@@ -1,0 +1,137 @@
+# =============================================================================
+# Horizontal Pod Autoscalers — API + Worker
+# =============================================================================
+#
+# API HPA:
+#   Scales on CPU utilisation.
+#   Target: keep average CPU at 60% (leaves headroom for traffic spikes).
+#   Range: 3 (min HA) → 10 replicas.
+#   Scale-down is conservative: wait 5 min before removing a replica.
+#
+# Worker HPA (queue-depth based):
+#   Scales based on the number of tasks in the Celery queue.
+#   Uses the prometheus-adapter to expose a custom metric:
+#     celery_queue_length{queue="documents.ingest"}
+#   Target: 1 worker per 2 queued tasks (configurable).
+#   Range: 2 → 20 replicas.
+#
+# Prerequisites:
+#   API HPA:    metrics-server installed (standard on EKS/GKE)
+#   Worker HPA: prometheus-adapter + prometheus-operator configured
+#               (see infra/prometheus/ for ServiceMonitor and adapter config)
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# API HPA — CPU-based (+ optional memory)
+# ---------------------------------------------------------------------------
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rag-api-hpa
+  namespace: rag-platform
+  labels:
+    app.kubernetes.io/name:      rag-platform
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind:       Deployment
+    name:       rag-api
+
+  minReplicas: 3
+  maxReplicas: 10
+
+  metrics:
+    # Primary: CPU utilisation
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type:               Utilization
+          averageUtilization: 60
+
+    # Secondary: memory (prevents OOM cascades)
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type:               Utilization
+          averageUtilization: 75
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60     # wait 1 min before scaling up again
+      policies:
+        - type:          Pods
+          value:         2               # add at most 2 pods at a time
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300    # wait 5 min before scaling down
+      policies:
+        - type:          Pods
+          value:         1               # remove at most 1 pod at a time
+          periodSeconds: 120
+
+---
+# ---------------------------------------------------------------------------
+# Worker HPA — Queue depth (custom metric via Prometheus adapter)
+# ---------------------------------------------------------------------------
+# The custom metric "celery_queue_length" is exposed by the celery-exporter
+# sidecar and scraped by Prometheus, then made available to the HPA via
+# the prometheus-adapter.
+#
+# To enable: deploy prometheus-adapter with adapter config pointing to
+#   `sum(celery_queue_length{queue="documents.ingest"}) by (namespace)`
+# ---------------------------------------------------------------------------
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rag-worker-hpa
+  namespace: rag-platform
+  labels:
+    app.kubernetes.io/name:      rag-platform
+    app.kubernetes.io/component: worker
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind:       Deployment
+    name:       rag-worker
+
+  minReplicas: 2
+  maxReplicas: 20
+
+  metrics:
+    # CPU (always useful as a safety net)
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type:               Utilization
+          averageUtilization: 70
+
+    # Custom: Celery queue depth via Prometheus adapter
+    # Each worker processes 4 tasks concurrently; aim for 2 queued per worker
+    - type: External
+      external:
+        metric:
+          name: celery_queue_length
+          selector:
+            matchLabels:
+              queue: documents.ingest
+        target:
+          type:         AverageValue
+          averageValue: "2"   # scale up when queue > 2 tasks per worker replica
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30     # aggressive scale-up (don't let queue grow)
+      policies:
+        - type:          Pods
+          value:         4
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 600   # wait 10 min before removing workers
+      policies:
+        - type:          Pods
+          value:         2
+          periodSeconds: 120

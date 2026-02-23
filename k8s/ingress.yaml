@@ -1,0 +1,114 @@
+# =============================================================================
+# Ingress — NGINX Ingress Controller with TLS
+# =============================================================================
+#
+# Prerequisites:
+#   kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.10.0/deploy/static/provider/cloud/deploy.yaml
+#   kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.15.0/cert-manager.yaml
+#
+# TLS:
+#   cert-manager automatically provisions and renews Let's Encrypt certificates.
+#   Replace "api.ragplatform.example.com" with your actual domain.
+#
+# Rate limiting:
+#   nginx.ingress.kubernetes.io/limit-rps: "20"
+#   nginx.ingress.kubernetes.io/limit-burst-multiplier: "5"
+#   → Allows burst of 100 RPS, sustained 20 RPS per source IP
+#
+# SSE configuration:
+#   proxy-read-timeout: "3600"  — keep SSE connections open up to 1 hour
+#   proxy-buffering: "off"      — disable nginx response buffering for SSE
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rag-platform-ingress
+  namespace: rag-platform
+  annotations:
+    # Ingress class
+    kubernetes.io/ingress.class: "nginx"
+
+    # TLS — cert-manager
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+
+    # Rate limiting — per source IP
+    nginx.ingress.kubernetes.io/limit-rps:              "20"
+    nginx.ingress.kubernetes.io/limit-connections:      "10"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "5"
+
+    # SSE streaming — disable buffering, extend timeout
+    nginx.ingress.kubernetes.io/proxy-read-timeout:    "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout:    "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering:       "off"
+    nginx.ingress.kubernetes.io/proxy-http-version:    "1.1"
+
+    # Security headers
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      add_header X-Frame-Options         "DENY"         always;
+      add_header X-Content-Type-Options  "nosniff"      always;
+      add_header X-XSS-Protection        "1; mode=block" always;
+      add_header Referrer-Policy         "strict-origin" always;
+      add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    # Body size limit — match MAX_FILE_SIZE_BYTES (500 MB)
+    nginx.ingress.kubernetes.io/proxy-body-size: "500m"
+
+    # Upstream keepalives
+    nginx.ingress.kubernetes.io/upstream-keepalive-connections: "32"
+
+spec:
+  ingressClassName: nginx
+
+  tls:
+    - hosts:
+        - api.ragplatform.example.com   # ← replace with your domain
+      secretName: rag-platform-tls
+
+  rules:
+    - host: api.ragplatform.example.com   # ← replace with your domain
+      http:
+        paths:
+          # API v1 — all traffic
+          - path:     /api/v1
+            pathType: Prefix
+            backend:
+              service:
+                name: rag-api
+                port:
+                  name: http
+
+          # Health probes — no rate limiting needed
+          - path:     /health
+            pathType: Prefix
+            backend:
+              service:
+                name: rag-api
+                port:
+                  name: http
+
+          # Metrics — restrict to VPC / internal (add allowlist annotation in prod)
+          - path:     /metrics
+            pathType: Exact
+            backend:
+              service:
+                name: rag-api
+                port:
+                  name: http
+---
+# =============================================================================
+# ClusterIssuer — Let's Encrypt production
+# =============================================================================
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email:  devops@yourcompany.com   # ← replace with your ops email
+    privateKeySecretRef:
+      name: letsencrypt-prod-key
+    solvers:
+      - http01:
+          ingress:
+            class: nginx

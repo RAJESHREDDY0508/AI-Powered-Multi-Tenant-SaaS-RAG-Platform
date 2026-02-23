@@ -1,0 +1,180 @@
+# =============================================================================
+# Worker Deployment — Celery Document Ingestion Worker
+# =============================================================================
+#
+# Scaling strategy:
+#   - Worker replicas scale on Redis queue depth (via KEDA or custom metrics)
+#   - Each pod runs 4 concurrent coroutines (Celery --concurrency=4)
+#   - HPA scales 2 → 20 replicas based on queue length
+#
+# Resource sizing:
+#   - OCR (Unstructured) is CPU-heavy: 1-2 CPU per concurrent task
+#   - Embedding (OpenAI API): mostly I/O bound — high concurrency OK
+#   - Set memory limit high enough for PyMuPDF page rendering (256 MB/page)
+#
+# Celery reliability:
+#   - acks_late=True: task not acked until completion
+#   - reject_on_worker_lost=True: re-queue on pod OOM kill
+#   - TERM signal: Celery warm shutdown (finish current task, stop)
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-worker
+  namespace: rag-platform
+  labels:
+    app.kubernetes.io/name:      rag-platform
+    app.kubernetes.io/component: worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: worker
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge:       1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name:      rag-platform
+        app.kubernetes.io/component: worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "9100"   # celery-exporter sidecar
+    spec:
+      serviceAccountName: rag-worker-sa
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser:    1001
+        runAsGroup:   1001
+
+      containers:
+        - name: worker
+          image: "YOUR_ECR_REPO/rag-platform/worker:latest"
+          imagePullPolicy: Always
+
+          envFrom:
+            - configMapRef:
+                name: rag-platform-config
+            - secretRef:
+                name: rag-platform-secrets
+
+          env:
+            - name: CELERY_WORKER_CONCURRENCY
+              value: "4"
+
+          resources:
+            requests:
+              cpu:    "1"
+              memory: "1Gi"
+            limits:
+              cpu:    "4"
+              memory: "4Gi"       # headroom for OCR + large PDFs
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+          livenessProbe:
+            exec:
+              # Celery workers expose a ping over AMQP
+              command:
+                - /bin/bash
+                - -c
+                - "celery -A app.workers.celery_app inspect ping -d celery@$HOSTNAME --timeout 5 > /dev/null 2>&1"
+            initialDelaySeconds: 60
+            periodSeconds:      30
+            timeoutSeconds:     15
+            failureThreshold:   3
+
+        # ── Sidecar: celery-exporter for Prometheus metrics ───────────────
+        - name: celery-exporter
+          image: danihodovic/celery-exporter:latest
+          ports:
+            - containerPort: 9100
+              name: metrics
+          env:
+            - name: CE_BROKER_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: rag-platform-config
+                  key:  CELERY_BROKER_URL
+          resources:
+            requests:
+              cpu:    "50m"
+              memory: "64Mi"
+            limits:
+              cpu:    "200m"
+              memory: "128Mi"
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+      # Give workers 5 minutes to finish the current task on SIGTERM
+      terminationGracePeriodSeconds: 330
+---
+# =============================================================================
+# Beat Deployment — Celery Beat (periodic task scheduler)
+# IMPORTANT: Always run exactly 1 replica of Beat
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-beat
+  namespace: rag-platform
+  labels:
+    app.kubernetes.io/name:      rag-platform
+    app.kubernetes.io/component: beat
+spec:
+  replicas: 1       # ← NEVER scale above 1 (would duplicate scheduled tasks)
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: beat
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name:      rag-platform
+        app.kubernetes.io/component: beat
+    spec:
+      serviceAccountName: rag-worker-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser:    1001
+
+      containers:
+        - name: beat
+          image: "YOUR_ECR_REPO/rag-platform/beat:latest"
+          imagePullPolicy: Always
+
+          envFrom:
+            - configMapRef:
+                name: rag-platform-config
+            - secretRef:
+                name: rag-platform-secrets
+
+          resources:
+            requests:
+              cpu:    "100m"
+              memory: "128Mi"
+            limits:
+              cpu:    "500m"
+              memory: "256Mi"
+
+          volumeMounts:
+            - name: beat-schedule
+              mountPath: /tmp
+
+      volumes:
+        - name: beat-schedule
+          emptyDir: {}
+
+      terminationGracePeriodSeconds: 10

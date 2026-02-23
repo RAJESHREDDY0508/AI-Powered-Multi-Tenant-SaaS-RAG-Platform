@@ -82,6 +82,39 @@ class Settings(BaseSettings):
     s3_default_kms_key_arn: str = ""
 
     # ------------------------------------------------------------------
+    # Hybrid Retrieval (Phase 3.1)
+    # ------------------------------------------------------------------
+    cohere_api_key:        str = ""    # Cohere ReRank — leave empty to disable
+    cohere_rerank_model:   str = "rerank-english-v3.0"
+    hybrid_dense_k:        int = 20   # dense retrieval candidate count
+    hybrid_bm25_k:         int = 20   # BM25 candidate count
+    hybrid_rerank_top_n:   int = 5    # final output size after reranking
+
+    # ------------------------------------------------------------------
+    # LLM Gateway — provider fallback (Phase 4)
+    # ------------------------------------------------------------------
+    # Azure OpenAI (GDPR-compliant fallback)
+    azure_openai_api_key:     str = ""
+    azure_openai_endpoint:    str = ""
+    azure_openai_deployment:  str = "gpt-4o"
+    azure_openai_api_version: str = "2024-08-01-preview"
+
+    # Ollama (local / air-gapped)
+    ollama_base_url: str = "http://localhost:11434"
+
+    # ------------------------------------------------------------------
+    # Observability (Phase 5)
+    # ------------------------------------------------------------------
+    langsmith_api_key: str = ""
+    langsmith_project: str = "rag-platform"
+
+    phoenix_enabled:  bool = False
+    phoenix_endpoint: str  = "http://localhost:6006/v1/traces"
+
+    otel_enabled:              bool = False
+    otel_exporter_otlp_endpoint: str = ""
+
+    # ------------------------------------------------------------------
     # Application
     # ------------------------------------------------------------------
     app_env: str = "development"   # development | staging | production

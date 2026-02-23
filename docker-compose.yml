@@ -1,0 +1,313 @@
+# =============================================================================
+# Docker Compose — Full local development stack
+# =============================================================================
+#
+# Services:
+#   api         — FastAPI + Uvicorn (port 8000)
+#   worker      — Celery ingestion worker
+#   beat        — Celery Beat scheduler
+#   postgres    — PostgreSQL 16 (port 5432)
+#   redis       — Redis 7 (port 6379) — Celery broker + result backend
+#   weaviate    — Weaviate vector store (port 8080 + gRPC 50051)
+#   minio       — S3-compatible local object storage (port 9000, console 9001)
+#   phoenix     — Arize Phoenix observability UI (port 6006)
+#
+# Quick start:
+#   docker compose up -d postgres redis weaviate minio    # infra only
+#   docker compose up -d                                  # full stack
+#
+# Environment variables:
+#   Copy .env.example → .env and fill in API keys before starting.
+#
+# Data persistence:
+#   All volumes are named — data survives docker compose down.
+#   To reset: docker compose down -v
+# =============================================================================
+
+version: "3.9"
+
+# ---------------------------------------------------------------------------
+# Shared environment for the application services
+# ---------------------------------------------------------------------------
+x-app-env: &app-env
+  DATABASE_URL:         "postgresql+asyncpg://rag:rag@postgres:5432/ragplatform"
+  REDIS_URL:            "redis://redis:6379/0"
+  S3_BUCKET:            "rag-platform-documents"
+  AWS_ACCESS_KEY_ID:    "minioadmin"
+  AWS_SECRET_ACCESS_KEY:"minioadmin"
+  AWS_REGION:           "us-east-1"
+  # Override S3 endpoint to point at local MinIO
+  S3_ENDPOINT_URL:      "http://minio:9000"
+  VECTOR_STORE_BACKEND: "weaviate"
+  WEAVIATE_URL:         "http://weaviate:8080"
+  WEAVIATE_HOST:        "weaviate"
+  WEAVIATE_PORT:        "8080"
+  PHOENIX_ENABLED:      "true"
+  PHOENIX_ENDPOINT:     "http://phoenix:6006/v1/traces"
+  APP_ENV:              "development"
+  DEBUG:                "true"
+  # Secrets — override in .env
+  OPENAI_API_KEY:       "${OPENAI_API_KEY:-}"
+  AUTH_ISSUER:          "${AUTH_ISSUER:-}"
+  AUTH_AUDIENCE:        "${AUTH_AUDIENCE:-}"
+  COHERE_API_KEY:       "${COHERE_API_KEY:-}"
+  LANGSMITH_API_KEY:    "${LANGSMITH_API_KEY:-}"
+  LANGSMITH_PROJECT:    "${LANGSMITH_PROJECT:-rag-platform-dev}"
+
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Next.js Frontend
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_APP_VERSION: "${APP_VERSION:-dev}"
+    image: rag-platform/frontend:dev
+    container_name: rag_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      BACKEND_URL: "http://api:8000"
+      NEXT_PUBLIC_APP_URL: "http://localhost:3000"
+    depends_on:
+      - api
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # FastAPI Application
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context:  ./backend
+      target:   api
+      dockerfile: Dockerfile
+    image: rag-platform/api:dev
+    container_name: rag_api
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *app-env
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      weaviate:
+        condition: service_healthy
+    volumes:
+      # Hot-reload in development: mount source code
+      - ./backend:/app:cached
+    command:
+      - uvicorn
+      - app.main:app
+      - --host=0.0.0.0
+      - --port=8000
+      - --reload                # ← development mode only
+      - --log-level=debug
+    restart: unless-stopped
+    networks:
+      - rag_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout:  10s
+      retries:  3
+
+  # ---------------------------------------------------------------------------
+  # Celery Worker — Document Ingestion
+  # ---------------------------------------------------------------------------
+  worker:
+    build:
+      context:    ./backend
+      target:     worker
+      dockerfile: Dockerfile
+    image: rag-platform/worker:dev
+    container_name: rag_worker
+    environment:
+      <<: *app-env
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+      - redis
+      - weaviate
+      - minio
+    volumes:
+      - ./backend:/app:cached
+    command:
+      - celery
+      - -A
+      - app.workers.celery_app
+      - worker
+      - --queues=documents.ingest,documents.retry
+      - --concurrency=2
+      - --loglevel=info
+    restart: unless-stopped
+    networks:
+      - rag_network
+
+  # ---------------------------------------------------------------------------
+  # Celery Beat — Periodic Tasks (retry scanner)
+  # ---------------------------------------------------------------------------
+  beat:
+    build:
+      context:    ./backend
+      target:     beat
+      dockerfile: Dockerfile
+    image: rag-platform/beat:dev
+    container_name: rag_beat
+    environment:
+      <<: *app-env
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    volumes:
+      - ./backend:/app:cached
+    command:
+      - celery
+      - -A
+      - app.workers.celery_app
+      - beat
+      - --loglevel=info
+    restart: unless-stopped
+    networks:
+      - rag_network
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 16
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: rag_postgres
+    environment:
+      POSTGRES_USER:     rag
+      POSTGRES_PASSWORD: rag
+      POSTGRES_DB:       ragplatform
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Init scripts — run once on first start
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:     ["CMD-SHELL", "pg_isready -U rag -d ragplatform"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+    networks:
+      - rag_network
+
+  # ---------------------------------------------------------------------------
+  # Redis 7 — Celery broker + result backend
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: rag_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --save 60 1 --loglevel warning
+    healthcheck:
+      test:     ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout:  5s
+      retries:  3
+    networks:
+      - rag_network
+
+  # ---------------------------------------------------------------------------
+  # Weaviate — Vector Store
+  # ---------------------------------------------------------------------------
+  weaviate:
+    image: semitechnologies/weaviate:1.25.4
+    container_name: rag_weaviate
+    ports:
+      - "8080:8080"
+      - "50051:50051"   # gRPC
+    environment:
+      QUERY_DEFAULTS_LIMIT:      "25"
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH:     "/var/lib/weaviate"
+      DEFAULT_VECTORIZER_MODULE: "none"
+      ENABLE_MODULES:            ""
+      CLUSTER_HOSTNAME:          "node1"
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    healthcheck:
+      test:     ["CMD", "curl", "-f", "http://localhost:8080/v1/.well-known/ready"]
+      interval: 15s
+      timeout:  10s
+      retries:  5
+    networks:
+      - rag_network
+
+  # ---------------------------------------------------------------------------
+  # MinIO — S3-compatible local object storage
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:RELEASE.2024-04-06T05-26-02Z
+    container_name: rag_minio
+    ports:
+      - "9000:9000"     # S3 API
+      - "9001:9001"     # Web console → http://localhost:9001
+    environment:
+      MINIO_ROOT_USER:     minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test:     ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout:  10s
+      retries:  3
+    networks:
+      - rag_network
+
+  # ---------------------------------------------------------------------------
+  # Arize Phoenix — Observability / Tracing UI
+  # ---------------------------------------------------------------------------
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    container_name: rag_phoenix
+    ports:
+      - "6006:6006"   # UI → http://localhost:6006
+      - "4317:4317"   # gRPC OTEL ingestion
+    environment:
+      PHOENIX_SERVER_HOST: "0.0.0.0"
+    volumes:
+      - phoenix_data:/root/.phoenix
+    networks:
+      - rag_network
+
+
+# ---------------------------------------------------------------------------
+# Named volumes — data survives container restarts
+# ---------------------------------------------------------------------------
+volumes:
+  postgres_data:
+  redis_data:
+  weaviate_data:
+  minio_data:
+  phoenix_data:
+
+# ---------------------------------------------------------------------------
+# Shared bridge network
+# ---------------------------------------------------------------------------
+networks:
+  rag_network:
+    driver: bridge

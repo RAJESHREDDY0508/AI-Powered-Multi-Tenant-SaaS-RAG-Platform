@@ -39,6 +39,8 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.v1.documents import router as documents_router
+from app.api.v1.query import router as query_router
+from app.evaluation.dashboard import router as eval_router
 from app.core.config import settings
 from app.db.session import check_db_health
 from app.schemas.documents import ErrorResponse, ErrorDetail
@@ -205,6 +207,12 @@ def create_app() -> FastAPI:
     # ----------------------------------------------------------------
 
     app.include_router(documents_router, prefix="/api/v1")
+    app.include_router(query_router,     prefix="/api/v1")
+    app.include_router(eval_router,      prefix="/api/v1")
+
+    # Initialise observability tracing (LangSmith / Phoenix / OTEL)
+    from app.observability.tracing import TracingConfig
+    TracingConfig.init()
 
     # ----------------------------------------------------------------
     # Health & readiness endpoints (no auth — used by load balancer)
@@ -219,6 +227,12 @@ def create_app() -> FastAPI:
     async def health() -> dict:
         return {"status": "ok", "service": "rag-platform-api"}
 
+    @app.get(
+        "/health/ready",
+        tags=["Operations"],
+        summary="Readiness probe (k8s alias)",
+        description="Alias for /ready — used by Kubernetes readinessProbe.",
+    )
     @app.get(
         "/ready",
         tags=["Operations"],

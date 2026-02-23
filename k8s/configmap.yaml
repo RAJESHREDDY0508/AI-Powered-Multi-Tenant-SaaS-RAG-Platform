@@ -1,0 +1,52 @@
+# =============================================================================
+# ConfigMap — non-secret application configuration
+# =============================================================================
+# Secrets (API keys, DB passwords) are stored in AWS Secrets Manager /
+# Kubernetes Secrets and injected via the external-secrets operator.
+# Only non-sensitive defaults live here.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-platform-config
+  namespace: rag-platform
+  labels:
+    app.kubernetes.io/name:      rag-platform
+    app.kubernetes.io/component: config
+data:
+  # Application
+  APP_ENV:   "production"
+  DEBUG:     "false"
+  LOG_LEVEL: "info"
+
+  # Database connection pool
+  DB_POOL_SIZE:    "10"
+  DB_MAX_OVERFLOW: "20"
+  DB_ECHO_SQL:     "false"
+
+  # Vector store
+  VECTOR_STORE_BACKEND: "weaviate"
+  WEAVIATE_HOST:        "weaviate.weaviate.svc.cluster.local"
+  WEAVIATE_PORT:        "8080"
+
+  # Embeddings
+  EMBEDDING_MODEL:      "text-embedding-3-small"
+  EMBEDDING_DIMENSIONS: "1536"
+
+  # LLM defaults
+  LLM_MODEL:        "gpt-4o"
+  LLM_TEMPERATURE:  "0.0"
+  LLM_MAX_TOKENS:   "2048"
+
+  # S3 / AWS
+  AWS_REGION:  "us-east-1"
+  S3_BUCKET:   "rag-platform-documents-prod"
+
+  # Celery
+  CELERY_BROKER_URL:  "redis://redis-master.redis.svc.cluster.local:6379/0"
+  CELERY_RESULT_URL:  "redis://redis-master.redis.svc.cluster.local:6379/1"
+
+  # Observability
+  PHOENIX_ENABLED:  "true"
+  PHOENIX_ENDPOINT: "http://phoenix.observability.svc.cluster.local:6006/v1/traces"
+  OTEL_ENABLED:     "false"

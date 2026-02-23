@@ -1,0 +1,57 @@
+# =============================================================================
+# Kubernetes Namespace — rag-platform
+# =============================================================================
+# All platform resources (Deployments, Services, HPAs, Ingress) live here.
+# The namespace enables:
+#   - RBAC isolation (ClusterRole → RoleBinding scoped to namespace)
+#   - Resource quotas (CPU/memory limits per namespace)
+#   - Network policies (default-deny, whitelist app traffic)
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rag-platform
+  labels:
+    app.kubernetes.io/name: rag-platform
+    environment: production
+---
+# =============================================================================
+# Resource Quota — prevent runaway resource consumption
+# =============================================================================
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: rag-platform-quota
+  namespace: rag-platform
+spec:
+  hard:
+    # Compute
+    requests.cpu:    "16"
+    requests.memory: "32Gi"
+    limits.cpu:      "32"
+    limits.memory:   "64Gi"
+    # Object counts
+    pods:            "100"
+    services:        "20"
+    persistentvolumeclaims: "10"
+---
+# =============================================================================
+# LimitRange — default resource requests/limits for containers that omit them
+# =============================================================================
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: rag-platform-limits
+  namespace: rag-platform
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu:    "500m"
+        memory: "512Mi"
+      defaultRequest:
+        cpu:    "100m"
+        memory: "128Mi"
+      max:
+        cpu:    "4"
+        memory: "8Gi"

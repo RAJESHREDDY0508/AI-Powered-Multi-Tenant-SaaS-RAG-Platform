@@ -20,8 +20,10 @@ weaviate-client>=4.6.0       # Weaviate v4 client
 # LangChain — RAG orchestration
 langchain>=0.2.0
 langchain-core>=0.2.0
-langchain-openai>=0.1.0      # OpenAI embeddings + chat
-langchain-text-splitters>=0.2.0  # RecursiveCharacterTextSplitter
+langchain-openai>=0.1.0         # OpenAI embeddings + chat
+langchain-text-splitters>=0.2.0 # RecursiveCharacterTextSplitter
+langchain-community>=0.2.0      # LongContextReorder, ChatOllama
+langchain-aws>=0.1.0            # ChatBedrock (AWS Bedrock Claude)
 
 # Auth — JWT / OIDC
 python-jose[cryptography]>=3.3.0   # JWT decode + JWKS verification
@@ -53,9 +55,20 @@ openai>=1.30.0               # AsyncOpenAI for batch text-embedding-3-small
 python-magic>=0.4.27         # libmagic bindings for MIME sniffing (Linux/Mac)
 # python-magic-bin>=0.4.14   # Windows: uncomment this, comment python-magic above
 
-# Observability
-structlog>=24.1.0            # structured logging
-prometheus-fastapi-instrumentator>=6.1.0  # /metrics endpoint
+# Hybrid Retrieval — Phase 3.1
+rank-bm25>=0.2.2             # BM25 sparse retrieval (TenantBM25Index)
+cohere>=5.0.0                # Cohere ReRank cross-encoder (CohereReranker)
+
+# LLM Providers — Phase 4 (multi-provider gateway)
+anthropic>=0.25.0            # Anthropic Claude direct API (optional — prefer Bedrock)
+# langchain-community provides ChatOllama for local Llama 3
+
+# Observability — Phase 5
+structlog>=24.1.0                         # structured JSON logging
+prometheus-fastapi-instrumentator>=6.1.0  # /metrics endpoint (Prometheus)
+langsmith>=0.1.0                          # LangSmith tracing (optional, LANGCHAIN_API_KEY)
+# arize-phoenix-otel>=3.0.0              # Arize Phoenix OTEL tracing (uncomment to enable)
+# opentelemetry-sdk>=1.24.0             # Generic OTEL (uncomment for Jaeger/Datadog)
 
 # Testing
 pytest>=8.2.0

@@ -1,30 +1,29 @@
 """
-RAG Pipeline — LangChain LCEL Orchestration
+RAG Pipeline — LangChain LCEL Orchestration (v2 — Hybrid + Versioned Prompts)
 
-Implements the full Retrieve → Augment → Generate flow.
+Full query pipeline:
 
-Architecture:
   User Query
     │
     ▼
-  EmbeddingService        ← embed the query (OpenAI / Llama)
+  HybridRetriever          ← Dense + BM25 + RRF + Cohere ReRank
     │
     ▼
-  TenantScopedRetriever   ← vector search (Pinecone / Weaviate namespace)
+  LongContextReorder       ← Combat "Lost in the Middle" LLM bias
     │
     ▼
-  PromptBuilder           ← inject retrieved chunks into system prompt
+  PromptManager            ← DB-versioned system prompt with A/B routing
     │
     ▼
-  LLMService              ← OpenAI Chat / local Llama3 / Mistral
+  LLMGateway               ← Model router + fallback chain (GPT-4o → Azure → Bedrock)
     │
     ▼
-  Streaming Response      ← SSE stream to the client
+  Streaming Response       ← SSE token-by-token to the client
 
 Tenant guarantee:
-  - Retriever is instantiated with a tenant-scoped VectorStoreBase.
-  - System prompt always injects: "You are a private assistant for {tenant_name}."
-  - The LLM never receives chunks from another tenant — retriever enforces this.
+  - HybridRetriever is bound to a tenant-scoped VectorStoreBase.
+  - PromptManager always injects: "You are a private assistant for {tenant_name}."
+  - The LLM NEVER receives chunks from another tenant.
 """
 
 from __future__ import annotations
@@ -34,30 +33,32 @@ from uuid import UUID
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnableParallel, RunnablePassthrough
+from langchain_core.runnables import RunnablePassthrough
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.rag.retriever import TenantScopedRetriever
+from app.rag.hybrid_retriever import HybridRetriever
+from app.rag.prompt_manager import PromptManager
+from app.rag.reranker import CohereReranker
 from app.vectorstore.base import VectorStoreBase
 
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
-# System prompt template
+# Shared singletons (one per process — thread-safe for reads)
 # ---------------------------------------------------------------------------
 
-_SYSTEM_TEMPLATE = """\
-You are a private AI assistant for {tenant_name}.
-You answer questions ONLY using the provided context from the company's documents.
-If the answer is not in the context, say "I don't have enough information to answer that."
-Do not fabricate information. Do not reference information outside the provided context.
+_reranker: CohereReranker | None = None
 
-Context:
-{context}
-"""
 
-_HUMAN_TEMPLATE = "{question}"
+def _get_reranker() -> CohereReranker:
+    """Lazily initialise the Cohere reranker singleton."""
+    global _reranker
+    if _reranker is None:
+        _reranker = CohereReranker()
+    return _reranker
 
 
 # ---------------------------------------------------------------------------
@@ -66,9 +67,10 @@ _HUMAN_TEMPLATE = "{question}"
 
 def get_embedding_model() -> OpenAIEmbeddings:
     """
-    Returns the configured embedding model.
-    text-embedding-3-small  → 1536 dims  (default, cost-efficient)
-    text-embedding-3-large  → 3072 dims  (higher accuracy)
+    Return the configured OpenAI embedding model.
+
+    text-embedding-3-small → 1536 dims  (default, cost-efficient)
+    text-embedding-3-large → 3072 dims  (higher accuracy, 2× cost)
     """
     return OpenAIEmbeddings(
         model=settings.embedding_model,
@@ -83,8 +85,10 @@ def get_embedding_model() -> OpenAIEmbeddings:
 
 def get_llm(streaming: bool = False) -> ChatOpenAI:
     """
-    Returns the configured LLM.
-    Streaming=True enables token-by-token SSE streaming to the client.
+    Return the configured primary LLM.
+
+    streaming=True enables token-by-token SSE delivery to the client.
+    For multi-provider fallback, use LLMGateway instead.
     """
     return ChatOpenAI(
         model=settings.llm_model,
@@ -96,70 +100,90 @@ def get_llm(streaming: bool = False) -> ChatOpenAI:
 
 
 # ---------------------------------------------------------------------------
-# RAG chain factory
+# RAG chain factory (production version with hybrid + versioned prompts)
 # ---------------------------------------------------------------------------
 
-def build_rag_chain(
+async def build_rag_chain(
     vector_store: VectorStoreBase,
-    tenant_name: str,
-    streaming: bool = False,
-    top_k: int = 5,
+    tenant_id:    UUID,
+    tenant_name:  str,
+    db:           AsyncSession,
+    streaming:    bool  = False,
+    top_k:        int   = 5,
     score_threshold: float = 0.3,
 ):
     """
-    Build and return a LangChain LCEL RAG chain scoped to one tenant.
+    Build and return a fully-async RAG chain for one tenant.
 
-    The chain signature:
+    Chain signature::
         Input:  {"question": str}
-        Output: str  (or async stream of str tokens if streaming=True)
+        Output: str   (or AsyncIterator[str] if streaming=True)
+
+    Improvements over v1 pipeline:
+      - HybridRetriever (Dense + BM25 + Cohere ReRank) replaces plain vector search.
+      - DB-versioned system prompts with A/B testing via PromptManager.
+      - LongContextReorder applied before prompt injection.
 
     Args:
-        vector_store:     Tenant-scoped vector store (from dependency injection).
-        tenant_name:      Human-readable tenant name (injected into system prompt).
-        streaming:        Enable token streaming.
-        top_k:            Number of chunks to retrieve.
-        score_threshold:  Minimum similarity score to include a chunk.
+        vector_store:     Tenant-scoped vector store (from DI).
+        tenant_id:        UUID from authenticated JWT.
+        tenant_name:      Human-readable org name for prompt injection.
+        db:               Async DB session for prompt loading.
+        streaming:        Enable token streaming (for SSE endpoints).
+        top_k:            Final number of context chunks to inject.
+        score_threshold:  Minimum similarity score (soft filter on dense results).
 
     Returns:
-        A LangChain Runnable (LCEL chain).
+        LangChain Runnable (LCEL chain).
     """
-    embedder  = get_embedding_model()
-    retriever = TenantScopedRetriever(
+    embedder    = get_embedding_model()
+    reranker    = _get_reranker()
+    pm          = PromptManager(prompt_name="rag_system")
+    llm         = get_llm(streaming=streaming)
+
+    retriever = HybridRetriever(
         vector_store=vector_store,
-        top_k=top_k,
-        score_threshold=score_threshold,
+        embedder=embedder,
+        reranker=reranker,
+        dense_candidates=max(top_k * 4, 20),   # pull 4× more candidates for reranking
+        bm25_candidates=max(top_k * 4, 20),
+        rerank_top_n=top_k,
     )
-    llm       = get_llm(streaming=streaming)
+
+    # Load the system prompt from DB (with A/B variant selection)
+    system_template = await pm.get_system_prompt(
+        tenant_id=tenant_id,
+        tenant_name=tenant_name,
+        db=db,
+    )
 
     prompt = ChatPromptTemplate.from_messages([
-        ("system", _SYSTEM_TEMPLATE),
-        ("human",  _HUMAN_TEMPLATE),
+        ("system", system_template),
+        ("human",  "{question}"),
     ])
 
-    def format_docs(docs) -> str:
-        """Concatenate retrieved chunk texts with separators."""
-        return "\n\n---\n\n".join(
-            f"[Source: {d.metadata.get('source_key', 'unknown')} | "
-            f"Score: {d.metadata.get('score', 0):.3f}]\n{d.page_content}"
-            for d in docs
+    async def retrieve_and_format(inputs: dict) -> str:
+        """Hybrid retrieval → LongContextReorder → context string."""
+        docs = await retriever.retrieve(
+            query=inputs["question"],
+            top_k=top_k,
         )
-
-    async def embed_and_retrieve(inputs: dict) -> list:
-        """Embed the question, then retrieve relevant chunks."""
-        question = inputs["question"]
-        vector   = await embedder.aembed_query(question)
-        return await retriever._aget_relevant_documents(
-            vector,
-            run_manager=None,
-        )
+        # Filter by score threshold (applied on rerank_score or vector_score)
+        docs = [
+            d for d in docs
+            if (d.metadata.get("rerank_score") or d.metadata.get("vector_score", 1.0))
+            >= score_threshold
+        ]
+        # LongContextReorder — highest relevance at start & end
+        docs = pm.reorder_context(docs)
+        return pm.format_context(docs)
 
     # LCEL pipeline
     chain = (
-        RunnableParallel({
-            "context":  embed_and_retrieve | format_docs,
+        {
+            "context":  retrieve_and_format,
             "question": RunnablePassthrough() | (lambda x: x["question"]),
-            "tenant_name": RunnablePassthrough() | (lambda _: tenant_name),
-        })
+        }
         | prompt
         | llm
         | StrOutputParser()
@@ -169,16 +193,14 @@ def build_rag_chain(
 
 
 # ---------------------------------------------------------------------------
-# Convenience: embed a single query string
+# Convenience embedding helpers (used by ingestion pipeline)
 # ---------------------------------------------------------------------------
 
 async def embed_query(text: str) -> list[float]:
-    """Embed a single text string. Used by the ingestion pipeline."""
-    embedder = get_embedding_model()
-    return await embedder.aembed_query(text)
+    """Embed a single query string. Used during retrieval."""
+    return await get_embedding_model().aembed_query(text)
 
 
 async def embed_documents(texts: list[str]) -> list[list[float]]:
-    """Batch embed multiple texts. Used during document ingestion."""
-    embedder = get_embedding_model()
-    return await embedder.aembed_documents(texts)
+    """Batch embed multiple texts. Used during ingestion."""
+    return await get_embedding_model().aembed_documents(texts)

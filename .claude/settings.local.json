@@ -16,7 +16,8 @@
       "Bash(git -C \"C:\\\\Users\\\\rajes\\\\Desktop\\\\projects\\\\AI-Powered-Multi-Tenant-SaaS-RAG-Platform\" status -uall)",
       "Bash(dir /b \"C:\\\\Users\\\\rajes\\\\Desktop\\\\projects\\\\AI-Powered-Multi-Tenant-SaaS-RAG-Platform\\\\backend\\\\app\\\\api\\\\v1\"\" && dir /b \"C:UsersrajesDesktopprojectsAI-Powered-Multi-Tenant-SaaS-RAG-Platformbackendappauth\"\")",
       "Bash(dir /b \"C:\\\\Users\\\\rajes\\\\Desktop\\\\projects\\\\AI-Powered-Multi-Tenant-SaaS-RAG-Platform\\\\backend\\\\app\\\\services\"\" && dir /b \"C:UsersrajesDesktopprojectsAI-Powered-Multi-Tenant-SaaS-RAG-Platformbackendappstorage\"\")",
-      "Bash(dir /b \"C:\\\\Users\\\\rajes\\\\Desktop\\\\projects\\\\AI-Powered-Multi-Tenant-SaaS-RAG-Platform\\\\backend\\\\app\\\\workers\"\" && dir /b \"C:UsersrajesDesktopprojectsAI-Powered-Multi-Tenant-SaaS-RAG-Platformbackendappmodels\"\")"
+      "Bash(dir /b \"C:\\\\Users\\\\rajes\\\\Desktop\\\\projects\\\\AI-Powered-Multi-Tenant-SaaS-RAG-Platform\\\\backend\\\\app\\\\workers\"\" && dir /b \"C:UsersrajesDesktopprojectsAI-Powered-Multi-Tenant-SaaS-RAG-Platformbackendappmodels\"\")",
+      "Bash(type \"C:\\\\Users\\\\rajes\\\\Desktop\\\\projects\\\\AI-Powered-Multi-Tenant-SaaS-RAG-Platform\\\\frontend\\\\src\\\\app\\\\\\(dashboard\\)\\\\page.tsx\")"
     ]
   }
 }
